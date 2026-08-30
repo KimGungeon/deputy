@@ -439,6 +439,224 @@ def sync_label(cfg, num, decision):
 
 # ---------------------------------------------------------------- 명령
 
+# ---------------------------------------------------------------- 구조 감지
+
+SKIP_DIRS = {
+    "node_modules", "vendor", "dist", "build", "out", "target", "coverage",
+    ".git", ".venv", "venv", "__pycache__", ".next", ".nuxt", ".svelte-kit",
+    "migrations", "fixtures", "snapshots", ".claude", ".deputy", ".github",
+}
+# 이 이름들은 그 자체가 담당 단위라기보다 하위를 봐야 하는 껍데기다
+CONTAINER_DIRS = {"src", "lib", "packages", "apps", "services", "crates", "cmd",
+                  "modules", "components", "internal", "pkg"}
+TEST_DIRS = {"test", "tests", "spec", "specs", "__tests__", "e2e", "cypress"}
+
+LANG_BY_EXT = {
+    ".py": "Python", ".ts": "TypeScript", ".tsx": "TypeScript React",
+    ".js": "JavaScript", ".jsx": "JavaScript React", ".go": "Go",
+    ".rs": "Rust", ".java": "Java", ".kt": "Kotlin", ".rb": "Ruby",
+    ".php": "PHP", ".cs": "C#", ".swift": "Swift", ".c": "C", ".cpp": "C++",
+    ".h": "C/C++ 헤더", ".sql": "SQL", ".css": "CSS", ".scss": "SCSS",
+    ".html": "HTML", ".vue": "Vue", ".svelte": "Svelte", ".sh": "셸",
+    ".md": "문서", ".json": "설정", ".yml": "설정", ".yaml": "설정",
+}
+CODE_EXTS = {e for e in LANG_BY_EXT if e not in (".md", ".json", ".yml", ".yaml")}
+
+
+def shebang_ext(path):
+    """확장자가 없는 파일은 첫 줄의 shebang 으로 언어를 추정한다."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(120).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    if not first.startswith("#!"):
+        return ""
+    for key, ext in (("python", ".py"), ("node", ".js"), ("ruby", ".rb"),
+                     ("bash", ".sh"), ("sh", ".sh"), ("zsh", ".sh"), ("perl", ".pl")):
+        if key in first:
+            return ext
+    return ".sh"
+
+
+def tracked_files(root):
+    """git 이 아는 파일만 본다. .gitignore 가 이미 쓰레기를 걸러준다."""
+    r = subprocess.run(["git", "-C", root, "ls-files"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    return [f for f in r.stdout.splitlines() if f]
+
+
+def scan_repo(root):
+    """
+    저장소를 훑어 '담당 단위가 될 만한 디렉터리' 후보를 만든다.
+    규칙은 두 가지뿐이다.
+      · src/ packages/ 처럼 껍데기 디렉터리는 한 단계 더 들어간다
+      · tests/api 같은 테스트 디렉터리는 대응하는 코드 디렉터리에 붙인다
+    """
+    files = tracked_files(root)
+    buckets = {}          # 경로 -> {"files": n, "exts": {ext: n}}
+
+    for f in files:
+        parts = f.split("/")
+        if any(p in SKIP_DIRS for p in parts[:-1]):
+            continue
+        if len(parts) == 1:
+            key = "(루트 파일)"
+        else:
+            top = parts[0]
+            if top in CONTAINER_DIRS and len(parts) > 2:
+                key = f"{top}/{parts[1]}"
+            elif top in TEST_DIRS and len(parts) > 2:
+                key = f"{top}/{parts[1]}"
+            else:
+                key = top
+        b = buckets.setdefault(key, {"files": 0, "exts": {}})
+        b["files"] += 1
+        ext = os.path.splitext(f)[1].lower()
+        if not ext:
+            ext = shebang_ext(os.path.join(root, f))
+        b["exts"][ext] = b["exts"].get(ext, 0) + 1
+
+    cands = []
+    for path, b in buckets.items():
+        code = sum(n for e, n in b["exts"].items() if e in CODE_EXTS)
+        cands.append({"path": path, "files": b["files"], "code": code, "exts": b["exts"]})
+
+    # 테스트 디렉터리를 대응하는 코드 디렉터리에 흡수시킨다
+    by_leaf = {}
+    for c in cands:
+        leaf = c["path"].split("/")[-1]
+        if c["path"].split("/")[0] not in TEST_DIRS:
+            by_leaf.setdefault(leaf, c)
+    merged, absorbed = [], set()
+    for c in cands:
+        head = c["path"].split("/")[0]
+        leaf = c["path"].split("/")[-1]
+        if head in TEST_DIRS and leaf in by_leaf and by_leaf[leaf]["path"] != c["path"]:
+            tgt = by_leaf[leaf]
+            tgt.setdefault("extra", []).append(c["path"])
+            tgt["files"] += c["files"]; tgt["code"] += c["code"]
+            absorbed.add(c["path"])
+    for c in cands:
+        if c["path"] not in absorbed:
+            merged.append(c)
+
+    merged.sort(key=lambda c: (-c["code"], -c["files"], c["path"]))
+    return merged
+
+
+def describe(c):
+    """이 디렉터리가 무엇인지 한 줄로. 지배적인 언어와 파일 수로 만든다."""
+    langs = {}
+    for e, n in c["exts"].items():
+        if e in LANG_BY_EXT:
+            langs[LANG_BY_EXT[e]] = langs.get(LANG_BY_EXT[e], 0) + n
+    top = sorted(langs.items(), key=lambda x: -x[1])[:2]
+    lang = " · ".join(k for k, _ in top) or "기타"
+    return f"{lang}, 파일 {c['files']}개"
+
+
+def member_name(path, used):
+    """디렉터리 이름에서 멤버 이름을 만든다. 중복이면 상위 경로를 붙인다."""
+    leaf = path.split("/")[-1]
+    name = re.sub(r"[^a-z0-9-]", "-", leaf.lower()).strip("-") or "core"
+    if name in used:
+        prefix = re.sub(r"[^a-z0-9-]", "-", path.split("/")[0].lower())
+        name = f"{prefix}-{name}"
+    i = 2
+    base = name
+    while name in used:
+        name = f"{base}{i}"; i += 1
+    used.add(name)
+    return name
+
+
+def propose_members(cands, n):
+    """
+    담당은 '지배적인 디렉터리'만 준다. 남는 것을 억지로 배분하지 않는다.
+
+    남은 디렉터리를 전부 나눠 가지면 담당 경계가 의미를 잃는다. 그보다 무주지로
+    두는 편이 낫다. 무주지를 건드려야 하는 작업은 제안 단계에서 그 사실을 밝히게 되고,
+    그러면 다른 세션이 리뷰에서 걸러낼 기회가 생긴다.
+    """
+    ownable = [c for c in cands
+               if c["path"] != "(루트 파일)" and not c["path"].startswith(".")]
+    seeds = [c for c in ownable if c["code"] > 0][:n]
+    if len(seeds) < n:
+        # 코드 디렉터리가 요청한 멤버 수보다 적으면 문서·설정 디렉터리로 채운다.
+        # 담당이 갈리기만 하면 합의는 성립하고, 1인 운영보다는 낫다.
+        rest = [c for c in ownable if c["code"] == 0]
+        seeds = seeds + rest[: n - len(seeds)]
+    if not seeds:
+        seeds = ownable[:n]
+
+    used, members = set(), []
+    for c in seeds:
+        owns = [c["path"]] + c.get("extra", [])
+        # 이 씨앗의 하위 경로는 함께 가져간다 (services/x 를 services 가 먹지 않도록
+        # 정확히 prefix 인 것만)
+        for other in ownable:
+            if other is c:
+                continue
+            if other["path"].startswith(c["path"] + "/"):
+                owns.append(other["path"])
+                owns.extend(other.get("extra", []))
+        members.append({
+            "name": member_name(c["path"], used),
+            "owns": sorted(set(owns)),
+            "brief": describe(c),
+        })
+
+    claimed = {o for m in members for o in m["owns"]}
+    unowned = [c["path"] for c in cands if c["path"] not in claimed]
+    return members, unowned
+
+
+def print_scan(root, cands, members, unowned):
+    print(f"=== 구조 감지 :: {os.path.basename(root)} ===\n")
+    if not cands:
+        print("  추적 중인 파일이 없습니다. git add 를 먼저 하세요.")
+        return
+    print("후보 디렉터리 (코드 파일 수 순)")
+    for c in cands[:12]:
+        extra = f"  +{', '.join(c['extra'])}" if c.get("extra") else ""
+        print(f"  {c['path']:<34} 코드 {c['code']:>4}  전체 {c['files']:>4}  {describe(c)}{extra}")
+    if len(cands) > 12:
+        print(f"  … 외 {len(cands)-12}개")
+
+    print(f"\n제안 멤버 {len(members)}명")
+    for m in members:
+        print(f"  {m['name']:<12} {', '.join(m['owns'])}")
+        print(f"  {'':<12} {m['brief']}")
+
+    if unowned:
+        print(f"\n무주지 {len(unowned)}곳 — 아무도 담당하지 않습니다")
+        head = ", ".join(unowned[:8])
+        print(f"  {head}" + (f" … 외 {len(unowned)-8}곳" if len(unowned) > 8 else ""))
+        print("  세션은 여기를 건드리지 않습니다. 손대야 하는 작업은 제안에 그 사실을")
+        print("  밝히게 되고, 다른 세션이 리뷰에서 판단합니다.")
+        print("  자주 건드려야 한다면 .deputy/deputy.json 의 owns 에 직접 추가하세요.")
+
+    if len(members) < 2:
+        print("\n  [주의] 멤버가 1명이면 리뷰할 상대가 없어 토론과 합의가 일어나지 않습니다.")
+        print("  제안은 45분 뒤 기권 처리되어 자동 진행됩니다. 이슈 기반 진행과")
+        print("  파생 이슈 규칙은 그대로 동작하지만 교차 검증은 없습니다.")
+
+
+def cmd_scan(cfg_unused, args):
+    root = repo_root()
+    cands = scan_repo(root)
+    members, unowned = propose_members(cands, args.members)
+    print_scan(root, cands, members, unowned)
+    print("\n이대로 설치하려면:")
+    print(f"  deputy init" + (f" --members {args.members}" if args.members != 2 else ""))
+    print("\n담당을 직접 정하려면:")
+    parts = " \\\n              ".join(
+        f'--member "{m["name"]}:{",".join(m["owns"])}:{m["brief"]}"' for m in members)
+    print(f"  deputy init {parts}")
+
+
 def cmd_init(cfg_unused, args):
     """
     저장소 하나를 무인 협업 가능한 상태로 만든다. 어느 프로젝트에서든 이 명령 하나면 된다.
@@ -470,8 +688,22 @@ def cmd_init(cfg_unused, args):
                        "owns": [x for x in (parts[1].split(",") if len(parts) > 1 and parts[1] else [])],
                        "brief": parts[2] if len(parts) > 2 else ""})
         if not ms:
-            ms = [{"name": "alpha", "owns": [], "brief": ""},
-                  {"name": "beta", "owns": [], "brief": ""}]
+            # --member 를 안 줬으면 저장소 구조를 스캔해서 제안한다
+            cands = scan_repo(root)
+            if cands:
+                ms, unowned = propose_members(cands, args.members)
+                print("  구조를 스캔해 멤버를 제안했습니다:")
+                for m in ms:
+                    print(f"    {m['name']:<12} {', '.join(m['owns'])}")
+                    print(f"    {'':<12} {m['brief']}")
+                if unowned:
+                    print(f"    (무주지 {len(unowned)}곳은 아무도 담당하지 않습니다)")
+                print("  마음에 안 들면 .deputy/deputy.json 을 직접 고치거나")
+                print("  deputy scan 으로 후보를 다시 보세요.")
+            else:
+                print("  [주의] 추적 중인 파일이 없어 구조를 감지하지 못했습니다.")
+                ms = [{"name": "alpha", "owns": [], "brief": ""},
+                      {"name": "beta", "owns": [], "brief": ""}]
         cfg = {"review_timeout_minutes": 45, "max_revisions": 2, "members": ms}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
@@ -1089,6 +1321,8 @@ def main():
 """)
     s.add_argument("--member", action="append", help="이름:담당디렉터리,쉼표:역할설명")
     s.add_argument("--force", action="store_true", help="기존 멤버 설정을 덮어쓴다")
+    s.add_argument("--members", type=int, default=2, metavar="N",
+                   help="자동 감지 시 만들 멤버 수 (기본 2). --member 를 주면 무시된다")
     s.add_argument("--no-skills", dest="skills", action="store_false",
                    help="스킬 복사를 건너뛴다 (플러그인으로 설치한 경우)")
     s.add_argument("--no-settings", dest="settings", action="store_false",
@@ -1103,6 +1337,18 @@ def main():
     s.add_argument("--prefix", default="~/.local/bin", help="링크를 놓을 디렉터리")
     s.add_argument("--force", action="store_true", help="기존 링크를 덮어쓴다")
     s.set_defaults(fn=cmd_self_install, needs_cfg=False)
+
+    s = add("scan", "저장소 구조를 훑어 멤버 구성을 제안한다 (아무것도 바꾸지 않음)", """
+  deputy scan
+  deputy scan --members 3
+
+  git 이 추적하는 파일만 본다. .gitignore 가 이미 걸러준 것을 다시 거르지 않는다.
+  src/ packages/ 같은 껍데기 디렉터리는 한 단계 더 들어가고,
+  tests/api 는 src/api 에 자동으로 붙는다.
+""")
+    s.add_argument("--members", type=int, default=2, metavar="N",
+                   help="제안할 멤버 수 (기본 2)")
+    s.set_defaults(fn=cmd_scan, needs_cfg=False)
 
     s = add("next", "지금 무엇을 해야 하는지 (매 턴 실행)", """
   deputy next
