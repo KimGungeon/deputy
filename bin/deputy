@@ -78,6 +78,12 @@ MARK = re.compile(
 )
 VERDICTS = ("AGREE", "OBJECT", "AMEND")
 DERIVE_MARK = re.compile(r"<!--\s*deputy\s+v1\s+kind=derive\s+by=[\w.-]+\s+parent=(?P<parent>\d+)\s*-->")
+PLAN_MARK = re.compile(r"<!--\s*deputy\s+v1\s+kind=plan\s+by=(?P<by>[\w.-]+)\s+rev=(?P<rev>\d+)\s*-->")
+PLANNED_MARK = re.compile(
+    r"<!--\s*deputy\s+v1\s+kind=planned\s+by=[\w.-]+\s+parent=(?P<parent>\d+)"
+    r"\s+owner=(?P<owner>[\w.-]+)(?:\s+after=(?P<after>[\d,]*))?\s*-->")
+PLAN_JSON = re.compile(r"```deputy-plan\s*\n(?P<body>.*?)\n```", re.S)
+MAX_PLAN_CHILDREN = 12
 TASKLINE = re.compile(r"^- \[(?P<done>[ xX])\] #(?P<num>\d+)", re.M)
 COORDINATOR = "coordinator"   # 담당 디렉터리 없이 전체를 조율하는 역할
 BUILDER = "builder"           # 담당 디렉터리를 가지고 실제로 구현하는 역할
@@ -89,6 +95,7 @@ LABELS = {
     "deputy:revise":  ("FBCA04", "deputy: 이견 있음, 제안 수정 필요"),
     "deputy:wip":     ("5319E7", "deputy: 진행 중"),
     "deputy:blocked": ("B60205", "deputy: 합의 실패, 사람의 판단 필요"),
+    "deputy:epic":    ("6F42C1", "deputy: 자식 이슈로 쪼개진 큰 작업"),
 }
 
 
@@ -785,9 +792,19 @@ def cmd_init(cfg_unused, args):
 
 
 def parent_of(iss):
-    """이 이슈가 파생 이슈라면 부모 번호를 돌려준다."""
-    m = DERIVE_MARK.search(iss.get("body") or "")
+    """파생 이슈나 계획 자식이라면 부모(에픽) 번호를 돌려준다."""
+    body = iss.get("body") or ""
+    m = DERIVE_MARK.search(body) or PLANNED_MARK.search(body)
     return int(m.group("parent")) if m else None
+
+
+def planned_meta(iss):
+    """계획으로 만들어진 자식이면 담당자와 선행 이슈를 돌려준다."""
+    m = PLANNED_MARK.search(iss.get("body") or "")
+    if not m:
+        return None
+    after = [int(x) for x in (m.group("after") or "").split(",") if x.strip().isdigit()]
+    return {"parent": int(m.group("parent")), "owner": m.group("owner"), "after": after}
 
 
 def children_of(iss):
@@ -867,6 +884,263 @@ def cmd_derive(cfg, args):
     print("\n합의 절차 없이 바로 착수합니다. 끝나면:")
     print(f"  deputy done {child} --close --result \"...\"")
     print(f"부모 #{args.parent} 은 파생이 모두 닫힌 뒤에야 닫을 수 있습니다.")
+
+
+# ---------------------------------------------------------------- 큰 이슈 분해
+
+PLAN_TEMPLATE = """{
+  "summary": "이 에픽을 왜 이렇게 쪼갰는지 한 문단. 순서의 근거를 포함할 것.",
+  "children": [
+    {
+      "title": "오디오 캡처 모듈 뼈대와 인터페이스 확정",
+      "owner": "audio",
+      "why": "다른 모든 작업이 이 인터페이스에 의존한다. 먼저 고정해야 병렬 작업이 가능하다.",
+      "done_when": "pytest -q tests/audio/test_capture.py 가 0으로 종료하고 녹음 픽스처 3건을 통과한다",
+      "after": []
+    },
+    {
+      "title": "STT 래퍼: WAV 입력을 텍스트로",
+      "owner": "inference",
+      "why": "캡처 인터페이스가 고정되면 독립적으로 개발 가능하다.",
+      "done_when": "tests/fixtures/hello_ko.wav 입력 시 '안녕하세요' 를 포함한 텍스트가 나오고 pytest -q tests/stt 가 0으로 종료한다",
+      "after": [1]
+    }
+  ]
+}"""
+
+DONE_WHEN_HINTS = ("pytest", "npm", "go test", "cargo", "make", "exit", "종료",
+                   "통과", "`", "$", "0으로", "반환", "출력")
+
+
+def validate_plan(cfg, plan, epic_num):
+    """
+    분해 품질을 여기서 강제한다. 이 검사가 이 기능의 값어치 전부다.
+    나쁜 분해는 8시간을 통째로 태우는데, 그건 실행 중에는 아무도 못 알아챈다.
+    """
+    errs = []
+    builders = [m["name"] for m in cfg["members"] if m.get("role") != COORDINATOR]
+
+    if not isinstance(plan, dict):
+        return ["최상위가 객체가 아닙니다."]
+    if len((plan.get("summary") or "").strip()) < 30:
+        errs.append("summary 가 너무 짧습니다. 왜 이렇게 쪼갰고 순서의 근거가 무엇인지 쓰세요.")
+
+    children = plan.get("children")
+    if not isinstance(children, list) or not children:
+        return errs + ["children 이 비어 있습니다."]
+    if len(children) > MAX_PLAN_CHILDREN:
+        errs.append(f"자식이 {len(children)}개입니다 (상한 {MAX_PLAN_CHILDREN}). "
+                    f"에픽 자체가 너무 큽니다. 에픽을 둘로 나누세요.")
+
+    titles = set()
+    for i, ch in enumerate(children, 1):
+        tag = f"children[{i}]"
+        if not isinstance(ch, dict):
+            errs.append(f"{tag} 가 객체가 아닙니다."); continue
+
+        title = (ch.get("title") or "").strip()
+        if len(title) < 8:
+            errs.append(f"{tag} title 이 너무 짧습니다.")
+        elif title in titles:
+            errs.append(f"{tag} title 이 중복됩니다: {title!r}")
+        titles.add(title)
+
+        owner = (ch.get("owner") or "").strip()
+        if owner not in builders:
+            errs.append(f"{tag} owner={owner!r} 는 담당자가 아닙니다. "
+                        f"가능: {', '.join(builders)}. "
+                        f"조율자는 구현하지 않으므로 담당이 될 수 없습니다.")
+
+        if len((ch.get("why") or "").strip()) < 20:
+            errs.append(f"{tag} why 가 너무 짧습니다. 왜 이 작업이 독립 단위인지 쓰세요.")
+
+        dw = (ch.get("done_when") or "").strip()
+        if len(dw) < 25:
+            errs.append(f"{tag} done_when 이 너무 짧습니다.")
+        elif not any(h in dw for h in DONE_WHEN_HINTS):
+            errs.append(f"{tag} done_when 을 검증 가능하게 쓰세요. "
+                        f"실행할 명령과 기대 결과가 들어가야 합니다.\n"
+                        f"        지금: {dw[:80]}\n"
+                        f"        예시: \"pytest -q tests/stt 가 0으로 종료한다\"")
+
+        after = ch.get("after", [])
+        if not isinstance(after, list) or any(not isinstance(x, int) for x in after):
+            errs.append(f"{tag} after 는 정수 배열이어야 합니다 (children 의 1-based 순번).")
+        else:
+            for a in after:
+                if not (1 <= a <= len(children)):
+                    errs.append(f"{tag} after={a} 가 범위를 벗어났습니다.")
+                elif a == i:
+                    errs.append(f"{tag} 가 자기 자신을 선행으로 지정했습니다.")
+
+    # 순환 의존 검사
+    graph = {i: set(ch.get("after", []) or []) for i, ch in enumerate(children, 1)
+             if isinstance(ch, dict)}
+    seen, stack = set(), set()
+
+    def cyc(n):
+        if n in stack:
+            return True
+        if n in seen:
+            return False
+        seen.add(n); stack.add(n)
+        for m in graph.get(n, ()):
+            if isinstance(m, int) and cyc(m):
+                return True
+        stack.discard(n)
+        return False
+
+    if any(cyc(n) for n in list(graph)):
+        errs.append("선행 관계에 순환이 있습니다. 그러면 아무것도 시작할 수 없습니다.")
+
+    if graph and all(graph.get(i) for i in graph):
+        errs.append("모든 자식에 선행 작업이 있습니다. 처음 시작할 수 있는 게 없습니다.")
+
+    owners = {ch.get("owner") for ch in children if isinstance(ch, dict)}
+    if len(owners) == 1 and len(builders) > 1:
+        errs.append(f"모든 작업을 {owners.pop()!r} 혼자 맡습니다. 병렬로 돌릴 이유가 없어집니다. "
+                    f"담당을 나눌 수 없다면 그건 하나의 작업이지 에픽이 아닙니다.")
+    return errs
+
+
+def cmd_plan(cfg, args):
+    """
+    큰 이슈(에픽)를 실행 가능한 작은 이슈로 쪼갠다.
+
+    분해는 그 자체가 중요한 판단이므로 합의를 거친다. 파생 이슈와 다르다.
+    파생은 이미 합의된 완료 기준이 강제하는 사실이지만, 분해는 여러 갈래 중
+    하나를 고르는 선택이다. 잘못 고르면 8시간이 통째로 날아간다.
+    """
+    if args.template:
+        print(PLAN_TEMPLATE)
+        print("\n위 형식으로 파일을 만든 뒤:")
+        print("  deputy plan <에픽번호> --file plan.json")
+        print("\n지켜야 할 것:")
+        print("  · owner 는 담당자 이름이어야 한다 (조율자는 불가)")
+        print("  · done_when 은 실행할 명령과 기대 결과로 쓴다")
+        print("  · after 는 선행 자식의 1-based 순번. 순환이 있으면 거부된다")
+        print("  · 선행이 없는 자식이 최소 하나 있어야 한다")
+        print(f"  · 자식은 최대 {MAX_PLAN_CHILDREN}개. 넘으면 에픽을 나눠야 한다")
+        return
+
+    cfg = cfg or load_config()
+    me = whoami(cfg, args.as_)
+
+    if args.number is None:
+        die("에픽 이슈 번호가 필요합니다.  deputy plan <번호> --file plan.json")
+
+    epic = issue(args.number)
+
+    # --apply: 합의된 계획을 실제 이슈로 만든다
+    if args.apply:
+        cs = deputy_comments(epic)
+        plans = [c for c in cs if c["kind"] == "plan"]
+        if not plans:
+            die(f"#{args.number} 에 계획이 없습니다. 먼저 deputy plan {args.number} --file ... 을 하세요.")
+        v = consensus(cfg, epic)
+        if v["decision"] not in ("CLAIM", "ESCALATE") and not args.force:
+            die(f"계획이 아직 합의되지 않았습니다. 판정: {v['decision']}\n  {v['reason']}")
+
+        m = PLAN_JSON.search(plans[-1]["body"])
+        if not m:
+            die("계획 코멘트에서 deputy-plan 블록을 찾지 못했습니다.")
+        plan = json.loads(m.group("body"))
+        errs = validate_plan(cfg, plan, args.number)
+        if errs:
+            die("계획이 유효하지 않습니다:\n  " + "\n  ".join(errs))
+
+        created = []
+        for i, ch in enumerate(plan["children"], 1):
+            after_nums = [created[a - 1] for a in ch.get("after", []) if a <= len(created)]
+            body = (f"<!-- deputy v1 kind=planned by={me} parent={args.number} "
+                    f"owner={ch['owner']}"
+                    + (f" after={','.join(str(x) for x in after_nums)}" if after_nums else "")
+                    + " -->\n"
+                    f"**에픽 #{args.number} 의 계획된 작업**\n\n"
+                    f"## 왜 이 작업인가\n{ch['why']}\n\n"
+                    f"## 완료 기준\n{ch['done_when']}\n\n"
+                    + (f"## 선행 작업\n" + "\n".join(f"- #{x}" for x in after_nums) + "\n\n"
+                       if after_nums else "")
+                    + f"---\n담당: `{ch['owner']}`  ·  이 이슈는 승인된 계획에서 나왔으므로 "
+                      f"다시 제안·합의할 필요가 없습니다. 바로 착수하세요.")
+            url = gh(["issue", "create", "--title", ch["title"], "--body", body])
+            num = int(re.search(r"/issues/(\d+)", url or "").group(1)) if url and re.search(r"/issues/(\d+)", url) else None
+            if not num:
+                die(f"자식 이슈 생성 실패: {ch['title']}")
+            set_labels(num, add=["deputy:agreed"], verify=False)
+            created.append(num)
+            print(f"  #{num}  {ch['title']}   ← {ch['owner']}")
+
+        fresh = issue(args.number, check=False) or epic
+        pbody = fresh.get("body") or ""
+        if "### 계획된 작업" not in pbody:
+            pbody += "\n\n### 계획된 작업\n"
+        for num, ch in zip(created, plan["children"]):
+            pbody += f"- [ ] #{num} {ch['title']}\n"
+        gh(["issue", "edit", str(args.number), "--body", pbody], check=False)
+        set_labels(args.number, add=["deputy:epic"],
+                   remove=["deputy:next", "deputy:agreed", "deputy:revise"], verify=False)
+        gh(["issue", "comment", str(args.number), "--body",
+            f"<!-- deputy v1 kind=note by={me} -->\n"
+            f"### 🧩 계획 적용: 자식 이슈 {len(created)}건 생성\n\n"
+            + "\n".join(f"- #{n}" for n in created)
+            + f"\n\n이 에픽은 위 이슈가 모두 닫히기 전에는 닫히지 않습니다."], check=False)
+
+        print(f"\n에픽 #{args.number} 에 자식 {len(created)}건을 연결했습니다.")
+        print("각 자식은 승인된 계획에서 나왔으므로 재합의 없이 바로 착수 가능합니다.")
+        print("다음: deputy next")
+        return
+
+    # 계획 제출
+    if not args.file:
+        die("계획 파일이 필요합니다.  deputy plan <번호> --file plan.json\n"
+            "  형식을 보려면: deputy plan --template")
+    try:
+        plan = json.load(open(os.path.expanduser(args.file)))
+    except Exception as e:
+        die(f"{args.file} 을 읽을 수 없습니다: {e}")
+
+    errs = validate_plan(cfg, plan, args.number)
+    if errs:
+        print("계획이 품질 기준을 통과하지 못했습니다:\n", file=sys.stderr)
+        for e in errs:
+            print(f"  · {e}", file=sys.stderr)
+        print("\n고친 뒤 다시 제출하세요. 이 검사를 건너뛸 수 없습니다.", file=sys.stderr)
+        print("나쁜 분해는 실행 중에는 아무도 못 알아채고 8시간을 통째로 태웁니다.", file=sys.stderr)
+        sys.exit(2)
+
+    cs = deputy_comments(epic)
+    prev = [c for c in cs if c["kind"] == "plan"]
+    rev = (prev[-1]["rev"] + 1) if prev else 1
+
+    lines = []
+    for i, ch in enumerate(plan["children"], 1):
+        dep = f"  (선행: {', '.join('#'+str(a) for a in ch.get('after', []))})" if ch.get("after") else ""
+        lines.append(f"{i}. **{ch['title']}** — `{ch['owner']}`{dep}\n"
+                     f"   - 왜: {ch['why']}\n"
+                     f"   - 완료: {ch['done_when']}")
+
+    body = (f"<!-- deputy v1 kind=plan by={me} rev={rev} -->\n"
+            f"## 🧩 `{me}` 의 분해안" + (f" (수정본 rev{rev})" if rev > 1 else "") + "\n\n"
+            f"{plan['summary']}\n\n"
+            f"### 자식 작업 {len(plan['children'])}건\n\n" + "\n\n".join(lines) + "\n\n"
+            f"<details><summary>적용용 원본</summary>\n\n"
+            f"```deputy-plan\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n```\n\n</details>\n\n"
+            f"---\n분해는 이 실행의 방향을 결정합니다. 형식적으로 동의하지 말고 확인하세요:\n"
+            f"· 담당이 실제로 갈리는가, 아니면 같은 파일을 여럿이 건드리게 되는가\n"
+            f"· 순서가 맞는가. 인터페이스를 고정하는 작업이 먼저인가\n"
+            f"· 각 완료 기준이 사람 없이 검증 가능한가\n"
+            f"· 빠진 것이 있는가\n\n"
+            f"`deputy review {args.number} --verdict AGREE|OBJECT|AMEND --reason \"...\"`")
+    gh(["issue", "comment", str(args.number), "--body", body])
+    set_labels(args.number, add=["deputy:next"], remove=["deputy:revise"], verify=False)
+
+    others = [m for m in members(cfg) if m != me]
+    print(f"분해안 제출: #{args.number} rev{rev}  자식 {len(plan['children'])}건")
+    print(f"  검증 통과. 리뷰 대상: {', '.join(others) or '(단독)'}")
+    print(f"  {epic['url']}")
+    print(f"\n합의되면:  deputy plan {args.number} --apply")
+    print("기다리는 동안 멈추지 마세요. deputy next 로 다음 할 일을 확인하세요.")
 
 
 def cmd_propose(cfg, args):
@@ -1265,6 +1539,35 @@ def cmd_next(cfg, args):
         out.append('      deputy derive <부모번호> --why "..." --blocks "..." --done-when "..."')
         out.append("")
 
+    # 2.5순위: 계획으로 배정된 작업. 이미 합의된 것이라 바로 착수한다.
+    planned_mine, blocked_mine = [], []
+    for num, d in full.items():
+        meta = planned_meta(d)
+        if not meta or meta["owner"] != me:
+            continue
+        if "deputy:wip" in label_names(d) or d.get("assignees"):
+            continue
+        unmet = []
+        for a in meta["after"]:
+            dep = issue(a, cached=True, check=False)
+            if dep is None or dep.get("state") == "OPEN":
+                unmet.append(a)
+        (blocked_mine if unmet else planned_mine).append((d, meta, unmet))
+    if planned_mine:
+        out.append("[2순위] 계획으로 배정된 작업이 있습니다. 이미 합의된 것이라 바로 착수합니다.")
+        for d, meta, _ in planned_mine:
+            out.append(f"  · #{d['number']} {d['title']}  (에픽 #{meta['parent']})")
+        out.append(f"    → deputy claim <번호>   (재합의 불필요)")
+        out.append("")
+    if blocked_mine and not planned_mine:
+        out.append("[대기] 내게 배정됐지만 선행 작업이 안 끝났습니다.")
+        for d, meta, unmet in blocked_mine:
+            out.append(f"  · #{d['number']} {d['title']}")
+            out.append(f"    선행: {', '.join('#'+str(x) for x in unmet)} 이 아직 열려 있습니다")
+        out.append("    멈추지 말고 선행 작업의 인터페이스를 미리 읽어두거나,")
+        out.append("    테스트를 먼저 써두세요. 선행이 닫히는 즉시 구현에 들어갈 수 있습니다.")
+        out.append("")
+
     # 3순위: 내 제안의 판정
     waiting = []
     for num, d in full.items():
@@ -1520,6 +1823,22 @@ def main():
     DEPUTY_MEMBER=api deputy next
 """)
     s.set_defaults(fn=cmd_next)
+
+    s = add("plan", "큰 이슈를 실행 가능한 작은 이슈들로 쪼갠다", """
+  deputy plan --template            형식과 규칙을 본다
+  deputy plan 7 --file plan.json    분해안을 제출한다 (검증 후 합의 대기)
+  deputy plan 7 --apply             합의된 분해안을 실제 이슈로 만든다
+
+  분해는 합의를 거친다. 파생 이슈와 다르다.
+  파생은 이미 합의된 완료 기준이 강제하는 사실이지만,
+  분해는 여러 갈래 중 하나를 고르는 선택이다. 잘못 고르면 8시간이 날아간다.
+""")
+    s.add_argument("number", type=int, nargs="?", help="에픽 이슈 번호")
+    s.add_argument("--file", help="분해안 JSON 파일")
+    s.add_argument("--template", action="store_true", help="형식과 규칙을 출력한다")
+    s.add_argument("--apply", action="store_true", help="합의된 분해안을 이슈로 만든다")
+    s.add_argument("--force", action="store_true", help="합의 전에 적용한다")
+    s.set_defaults(fn=cmd_plan, needs_cfg=False)
 
     s = add("propose", "이슈를 다음 작업으로 제안한다", """
   deputy propose 12 \\
