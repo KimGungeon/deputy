@@ -62,6 +62,28 @@ export PATH="$HOME/.local/bin:$PATH" # 셸 설정에 추가
 
 ```bash
 cd ~/아무-프로젝트
+deputy init
+```
+
+멤버를 지정하지 않으면 **저장소 구조를 스캔해서 자동으로 제안**한다.
+`git ls-files` 로 추적 중인 파일만 보므로 `node_modules` 같은 것은 애초에 들어오지 않는다.
+`src/` `packages/` 같은 껍데기 디렉터리는 한 단계 더 들어가고, `tests/api` 는 `src/api` 에
+자동으로 붙는다. 확장자가 없는 실행 파일은 shebang 으로 언어를 판단한다.
+
+먼저 어떻게 나뉘는지만 보려면 (아무것도 바꾸지 않는다):
+
+```bash
+deputy scan
+deputy scan --members 3
+```
+
+**담당은 지배적인 디렉터리에만 준다.** 남는 디렉터리를 억지로 나눠 갖지 않고 무주지로
+남긴다. 담당 경계가 흐려지느니 아무도 안 갖는 편이 낫기 때문이다. 무주지를 건드려야 하는
+작업은 제안 단계에서 그 사실이 드러나고, 다른 세션이 리뷰에서 판단한다.
+
+직접 정하고 싶으면 여전히 명시할 수 있다:
+
+```bash
 deputy init --member "api:src/api,tests/api:백엔드 API 와 그 테스트" \
             --member "web:src/web,src/components:프론트엔드 UI"
 ```
@@ -183,6 +205,7 @@ deputy derive <부모번호> --why "무엇을 발견했나" \
 
 | 명령 | 하는 일 |
 |---|---|
+| `deputy scan` | 저장소 구조를 훑어 멤버 구성 제안 (변경 없음) |
 | `deputy next` | 지금 무엇을 할지 (매 턴 실행) |
 | `deputy propose <n>` | 이슈를 다음 작업으로 제안 |
 | `deputy review <n>` | 남의 제안 검토 |
