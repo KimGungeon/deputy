@@ -830,6 +830,19 @@ def open_children(iss):
     return out
 
 
+def epic_state(full):
+    """추적 중인 에픽을 '자식 다 끝난 것'과 '아직 남은 것'으로 가른다."""
+    done, ongoing = [], []
+    for num, d in full.items():
+        if "deputy:epic" not in label_names(d):
+            continue
+        openk = open_children(d)
+        (ongoing if openk else done).append((d, openk))
+    done.sort(key=lambda t: t[0]["number"])
+    ongoing.sort(key=lambda t: t[0]["number"])
+    return done, ongoing
+
+
 def cmd_derive(cfg, args):
     """
     작업 중 발견한 문제를 파생 이슈로 떼어낸다.
@@ -1387,6 +1400,19 @@ def next_for_coordinator(cfg, me, full, active, out):
         out.append('      deputy note <번호> "조율 판단: ..."')
         out.append("")
 
+    # 2순위: 자식이 모두 끝난 에픽을 닫는다.
+    # 이걸 아무도 안 하면 에픽이 열린 채 라벨에 갇혀 어느 목록에도 안 나온다.
+    epics_done, epics_open = epic_state(full)
+    if epics_done:
+        out.append("[2순위] 자식이 모두 닫힌 에픽이 있습니다. 마감하세요.")
+        for d, _ in epics_done:
+            kids = children_of(d)
+            out.append(f"  · #{d['number']} {d['title']}  (자식 {len(kids)}건 완료)")
+        out.append("    → 자식들의 결과를 종합해 무엇을 이뤘는지 정리한 뒤:")
+        out.append('      deputy done <번호> --close --result "에픽 완료: ..."')
+        out.append("    에픽을 닫아야 다음 에픽으로 넘어갑니다.")
+        out.append("")
+
     # 2.5순위: 내가 올린 분해안의 판정
     for num, d in full.items():
         cs = deputy_comments(d)
@@ -1410,8 +1436,15 @@ def next_for_coordinator(cfg, me, full, active, out):
     # 3순위: 전체 그림. 조율자만 볼 수 있는 것.
     wip = [d for n, d in full.items() if "deputy:wip" in label_names(d)]
     open_props = [d for n, d in full.items() if "deputy:next" in label_names(d)]
-    if wip or open_props:
+    if wip or open_props or epics_open:
         out.append("[3순위] 전체 현황을 점검하세요. 이걸 보는 건 당신뿐입니다.")
+        if epics_open:
+            out.append("  진행 중 에픽:")
+            for d, openk in epics_open:
+                kids = children_of(d)
+                out.append(f"    · #{d['number']} {d['title'][:40]}  "
+                           f"({len(kids)-len(openk)}/{len(kids)} 완료, "
+                           f"남은 자식 {', '.join('#'+str(k) for k in openk[:4])})")
         if wip:
             out.append("  진행 중:")
             for d in wip:
@@ -1609,6 +1642,18 @@ def cmd_next(cfg, args):
         out.append("    테스트를 먼저 써두세요. 선행이 닫히는 즉시 구현에 들어갈 수 있습니다.")
         out.append("")
 
+    # 조율자가 없는 구성에서는 담당자가 에픽 마감을 맡는다.
+    # 그러지 않으면 에픽이 열린 채 어느 목록에도 나오지 않는다.
+    if not coordinators(cfg):
+        epics_done, _ = epic_state(full)
+        if epics_done:
+            out.append("[2순위] 자식이 모두 닫힌 에픽이 있습니다. 마감하세요.")
+            for d, _ in epics_done:
+                out.append(f"  · #{d['number']} {d['title']}")
+            out.append('    → deputy done <번호> --close --result "에픽 완료: ..."')
+            out.append("    에픽을 닫아야 다음 에픽으로 넘어갑니다.")
+            out.append("")
+
     # 3순위: 내 제안의 판정
     waiting = []
     for num, d in full.items():
@@ -1659,10 +1704,17 @@ def cmd_next(cfg, args):
                 for i in cand[:12]:
                     out.append(f"  · #{i['number']} {i['title']}")
                 out.append("")
-                out.append("내 담당 영역에 해당하고 되돌리기 쉬운 크기의 것을 하나 고른 뒤:")
+                out.append("내 담당 영역에 해당하는 것을 하나 고르고, 먼저 크기를 판단하세요.")
+                out.append("")
+                out.append("  한 번에 끝낼 수 있다 → 제안:")
                 out.append('  deputy propose <번호> --why "왜 지금 이것인지" \\')
                 out.append('    --alternatives "다른 후보를 왜 뒤로 미뤘는지" \\')
                 out.append('    --done-when "무엇이 참이면 끝인지 (명령과 기대 출력으로)"')
+                out.append("")
+                out.append("")
+                out.append("  한 번에 못 끝낼 만큼 크다 → 분해:")
+                out.append("  deputy plan --template   후   deputy plan <번호> --file plan.json")
+                out.append("  큰 이슈를 그대로 붙잡으면 컨텍스트가 넘쳐 세션이 멈춥니다.")
                 out.append("")
                 out.append("근거 없는 제안은 리뷰에서 막힙니다. 대안을 최소 하나 비교하세요.")
             else:
@@ -1845,9 +1897,11 @@ def cmd_status(cfg, args):
     if not tracked:
         print("추적 중인 이슈가 없습니다. `deputy next` 로 시작하세요.")
         return
-    order = ["deputy:wip", "deputy:next", "deputy:agreed", "deputy:revise", "deputy:blocked"]
-    titles = {"deputy:wip": "진행 중", "deputy:next": "리뷰 대기", "deputy:agreed": "합의 완료",
-              "deputy:revise": "수정 필요", "deputy:blocked": "막힘 - 사람 필요"}
+    order = ["deputy:epic", "deputy:wip", "deputy:next", "deputy:agreed",
+             "deputy:revise", "deputy:blocked"]
+    titles = {"deputy:epic": "에픽", "deputy:wip": "진행 중", "deputy:next": "리뷰 대기",
+              "deputy:agreed": "합의 완료", "deputy:revise": "수정 필요",
+              "deputy:blocked": "막힘 - 사람 필요"}
     for lb in order:
         group = [i for i in tracked if lb in label_names(i)]
         if not group:
