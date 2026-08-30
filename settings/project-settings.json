@@ -1,6 +1,5 @@
 {
   "_주석": "대상 프로젝트의 .claude/settings.json 으로 복사하세요. 저장소에 커밋해도 됩니다.",
-
   "permissions": {
     "allow": [
       "Bash(deputy:*)",
@@ -23,18 +22,41 @@
       "Bash(gh secret:*)"
     ]
   },
-
   "sandbox": {
-    "enabled": true,
+    "enabled": false,
     "credentials": {
       "files": [
-        { "path": "~/.aws/credentials", "mode": "deny" },
-        { "path": "~/.ssh", "mode": "deny" }
+        {
+          "path": "~/.aws/credentials",
+          "mode": "deny"
+        },
+        {
+          "path": "~/.ssh",
+          "mode": "deny"
+        }
       ],
       "env": [
-        { "name": "GITHUB_TOKEN", "mode": "deny" },
-        { "name": "NPM_TOKEN", "mode": "deny" }
+        {
+          "name": "GITHUB_TOKEN",
+          "mode": "deny"
+        },
+        {
+          "name": "NPM_TOKEN",
+          "mode": "deny"
+        }
+      ]
+    },
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "*.github.com",
+        "*.githubusercontent.com",
+        "pypi.org",
+        "*.pypi.org",
+        "files.pythonhosted.org",
+        "registry.npmjs.org"
       ]
     }
-  }
+  },
+  "_주석_sandbox": "샌드박스는 기본으로 꺼둔다. macOS 에서 샌드박스 프록시 환경일 때 gh CLI 의 TLS 검증이 실패한다 (x509: OSStatus -26276). curl 은 되지만 Go 로 만든 gh 는 플랫폼 검증기를 쓰는데 샌드박스 안에서 동작하지 않는다. network.allowedDomains, SSL_CERT_FILE, GODEBUG=x509usefallbackroots 모두 효과가 없었다. deputy 는 gh 에 전적으로 의존하므로 샌드박스를 켜면 무인 세션이 아무 일도 못 한다. 환경에서 gh 가 정상 동작한다면 enabled 를 true 로 바꿔도 된다. 아래 credentials 와 network 설정은 그때를 위해 남겨둔다. 안전은 permissions.deny 로 확보한다 - main push, force push, release, secret 차단."
 }
