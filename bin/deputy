@@ -1992,9 +1992,16 @@ def cmd_doctor(cfg, args):
         bad.append("배정만 남고 라벨이 없는 이슈가 있습니다 → 어떤 경로에서도 보이지 않습니다: "
                    + ", ".join(f"#{i['number']}" for i in orphans)
                    + "  (gh issue edit <번호> --remove-assignee @me 로 풀어주세요)")
-    (ok if free else bad).append(
-        f"작업 후보 이슈 {len(free)}건" if free
-        else "열린 이슈가 없습니다 → 세션이 할 일을 못 찾습니다. 이슈를 먼저 만드세요")
+    # 할 일이 있는지는 '라벨 없는 백로그'만으로 판단하면 안 된다.
+    # 분해된 에픽의 자식들은 deputy:agreed 를 달고 있어 백로그로 잡히지 않는다.
+    planned = [i for i in open_issues
+               if "deputy:epic" not in label_names(i)
+               and label_names(i) & {"deputy:agreed", "deputy:next", "deputy:wip"}]
+    if free or planned:
+        ok.append(f"할 일 있음 — 백로그 {len(free)}건, 진행 대상 {len(planned)}건")
+    else:
+        bad.append("열린 이슈가 없습니다 → 세션이 할 일을 못 찾습니다. "
+                   "이슈를 만들거나 에픽을 분해하세요")
 
     seen = {}
     if not coordinators(cfg):
