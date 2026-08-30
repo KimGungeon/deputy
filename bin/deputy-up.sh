@@ -48,8 +48,46 @@ print(m.get('brief','') or '(역할 미지정)')")
 import json
 m=[x for x in json.load(open('$CFG'))['members'] if x['name']=='$M'][0]
 print(', '.join(m.get('owns',[])) or '(담당 미지정)')")
+  ROLE=$(python3 -c "
+import json
+m=[x for x in json.load(open('$CFG'))['members'] if x['name']=='$M'][0]
+print(m.get('role','builder'))")
 
-  read -r -d '' PROMPT <<EOF || true
+  if [ "$ROLE" = "coordinator" ]; then
+    read -r -d '' PROMPT <<EOF || true
+너는 deputy 조율자 세션 '$M' 이다. $BRIEF
+담당 디렉터리가 없다. 코드를 고치지 않는다.
+
+너만 볼 수 있는 것이 있다. 담당자들은 자기 영역만 보지만 너는 전체를 본다.
+그래서 아무도 못 잡는 것을 잡는 게 네 일이다.
+  · 두 제안이 같은 파일을 건드리려 하는가
+  · 순서가 뒤집혔는가. 먼저 해야 할 것이 뒤에 있는가
+  · 오래 멈춰 있는 작업이 있는가
+  · 무주지를 건드리려는 제안이 있는가
+  · 백로그가 비어가는가
+
+작업 방식. 매 턴 이 순서를 지킨다.
+1. 먼저 \`deputy next\` 를 실행한다. 무엇을 할지는 이 출력이 정한다.
+2. 리뷰가 본업이다. 형식적으로 동의하지 말고 위 항목들을 실제로 확인한 뒤 판단한다.
+   담당자가 놓친 전체 관점의 문제를 찾는 것이 네가 존재하는 이유다.
+3. 합의가 깨진 이슈(deputy:blocked)는 네가 중재한다. 양쪽 근거를 읽고
+   범위를 어떻게 좁힐지 또는 어떻게 쪼갤지 정해 이슈에 남긴다.
+4. 급한 게 없으면 백로그를 손본다. 너무 큰 이슈는 쪼개고, 근거가 없는 이슈는 채운다.
+
+금지 사항.
+- 코드 파일 수정. 담당 디렉터리가 없다
+- deputy claim 으로 작업 착수
+- 담당자에게 지시하지 말고 근거를 들어 설득한다. 판단은 담당자가 한다
+
+코드 변경이 필요하면 담당 세션에 메시지로 요청한다:
+  "@frontend 이 제안이 backend 와 같은 파일을 건드려. 순서를 바꾸는 게 어때?"
+
+사람은 출근해 있고 폰으로 GitHub 이슈를 본다. 이슈 코멘트가 유일한 보고 채널이다.
+
+시작한다. 지금 바로 \`deputy next\` 를 실행하라.
+EOF
+  else
+    read -r -d '' PROMPT <<EOF || true
 너는 deputy 세션 '$M' 이다. 역할: $BRIEF
 담당 디렉터리: $OWNS — 이 밖의 파일은 절대 수정하지 않는다.
 
@@ -76,8 +114,9 @@ print(', '.join(m.get('owns',[])) or '(담당 미지정)')")
 
 시작한다. 지금 바로 \`deputy next\` 를 실행하라.
 EOF
+  fi
 
-  echo "  → $M 기동 중..."
+  echo "  → $M ($ROLE) 기동 중..."
   DEPUTY_MEMBER="$M" claude --bg --name "deputy-$M" "$PROMPT" >/dev/null 2>&1 || {
     echo "     실패. 수동으로 실행하세요:"
     echo "     DEPUTY_MEMBER=$M claude --bg --name deputy-$M \"...\""

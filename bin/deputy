@@ -79,6 +79,8 @@ MARK = re.compile(
 VERDICTS = ("AGREE", "OBJECT", "AMEND")
 DERIVE_MARK = re.compile(r"<!--\s*deputy\s+v1\s+kind=derive\s+by=[\w.-]+\s+parent=(?P<parent>\d+)\s*-->")
 TASKLINE = re.compile(r"^- \[(?P<done>[ xX])\] #(?P<num>\d+)", re.M)
+COORDINATOR = "coordinator"   # 담당 디렉터리 없이 전체를 조율하는 역할
+BUILDER = "builder"           # 담당 디렉터리를 가지고 실제로 구현하는 역할
 MAX_CHILDREN = 3          # 부모당 파생 이슈 상한. 넘으면 범위 설정이 틀린 것이다
 ISSUE_CACHE = {}          # deputy next 한 번에 같은 이슈를 여러 번 받아오지 않기 위한 캐시
 LABELS = {
@@ -244,6 +246,14 @@ def whoami(cfg, explicit=None):
     if name not in members(cfg):
         die(f"'{name}' 은 등록된 멤버가 아닙니다: {', '.join(members(cfg))}")
     return name
+
+
+def role_of(cfg, name):
+    return member_cfg(cfg, name).get("role", BUILDER)
+
+
+def coordinators(cfg):
+    return [m["name"] for m in cfg["members"] if m.get("role") == COORDINATOR]
 
 
 def member_cfg(cfg, name):
@@ -572,7 +582,7 @@ def member_name(path, used):
     return name
 
 
-def propose_members(cands, n):
+def propose_members(cands, n, with_coordinator=True):
     """
     담당은 '지배적인 디렉터리'만 준다. 남는 것을 억지로 배분하지 않는다.
 
@@ -608,8 +618,22 @@ def propose_members(cands, n):
             "brief": describe(c),
         })
 
+    for m in members:
+        m["role"] = BUILDER
+
     claimed = {o for m in members for o in m["owns"]}
     unowned = [c["path"] for c in cands if c["path"] not in claimed]
+
+    if with_coordinator:
+        # 담당이 없으므로 파일 충돌을 일으킬 수 없고, 전체를 보는 눈이 하나 생긴다.
+        # 멤버가 둘뿐일 때는 이 한 명이 정족수를 실질적으로 만들어 준다.
+        members.insert(0, {
+            "name": "lead",
+            "role": COORDINATOR,
+            "owns": [],
+            "brief": "담당 디렉터리 없음. 전체 우선순위 조율, 제안 교차 검증, "
+                     "충돌·정체 중재, 무주지 판단",
+        })
     return members, unowned
 
 
@@ -627,8 +651,9 @@ def print_scan(root, cands, members, unowned):
 
     print(f"\n제안 멤버 {len(members)}명")
     for m in members:
-        print(f"  {m['name']:<12} {', '.join(m['owns'])}")
-        print(f"  {'':<12} {m['brief']}")
+        tag = "[조율]" if m.get("role") == COORDINATOR else "[담당]"
+        print(f"  {tag} {m['name']:<12} {', '.join(m['owns']) or '(디렉터리 없음)'}")
+        print(f"  {'':<7}{'':<12} {m['brief']}")
 
     if unowned:
         print(f"\n무주지 {len(unowned)}곳 — 아무도 담당하지 않습니다")
@@ -638,6 +663,8 @@ def print_scan(root, cands, members, unowned):
         print("  밝히게 되고, 다른 세션이 리뷰에서 판단합니다.")
         print("  자주 건드려야 한다면 .deputy/deputy.json 의 owns 에 직접 추가하세요.")
 
+    if len([m for m in members if m.get("role") != COORDINATOR]) < 1:
+        print("\n  [주의] 담당자가 없습니다.")
     if len(members) < 2:
         print("\n  [주의] 멤버가 1명이면 리뷰할 상대가 없어 토론과 합의가 일어나지 않습니다.")
         print("  제안은 45분 뒤 기권 처리되어 자동 진행됩니다. 이슈 기반 진행과")
@@ -647,7 +674,7 @@ def print_scan(root, cands, members, unowned):
 def cmd_scan(cfg_unused, args):
     root = repo_root()
     cands = scan_repo(root)
-    members, unowned = propose_members(cands, args.members)
+    members, unowned = propose_members(cands, args.members, args.coordinator)
     print_scan(root, cands, members, unowned)
     print("\n이대로 설치하려면:")
     print(f"  deputy init" + (f" --members {args.members}" if args.members != 2 else ""))
@@ -684,18 +711,22 @@ def cmd_init(cfg_unused, args):
         ms = []
         for spec in (args.member or []):
             parts = spec.split(":", 2)
-            ms.append({"name": parts[0],
-                       "owns": [x for x in (parts[1].split(",") if len(parts) > 1 and parts[1] else [])],
+            name = parts[0]
+            owns = [x for x in (parts[1].split(",") if len(parts) > 1 and parts[1] else [])]
+            # 담당 디렉터리를 비워두면 조율자로 본다
+            ms.append({"name": name,
+                       "role": BUILDER if owns else COORDINATOR,
+                       "owns": owns,
                        "brief": parts[2] if len(parts) > 2 else ""})
         if not ms:
             # --member 를 안 줬으면 저장소 구조를 스캔해서 제안한다
             cands = scan_repo(root)
             if cands:
-                ms, unowned = propose_members(cands, args.members)
+                ms, unowned = propose_members(cands, args.members, args.coordinator)
                 print("  구조를 스캔해 멤버를 제안했습니다:")
                 for m in ms:
-                    print(f"    {m['name']:<12} {', '.join(m['owns'])}")
-                    print(f"    {'':<12} {m['brief']}")
+                    tag = "[조율]" if m.get("role") == COORDINATOR else "[담당]"
+                    print(f"    {tag} {m['name']:<12} {', '.join(m['owns']) or '(디렉터리 없음)'}")
                 if unowned:
                     print(f"    (무주지 {len(unowned)}곳은 아무도 담당하지 않습니다)")
                 print("  마음에 안 들면 .deputy/deputy.json 을 직접 고치거나")
@@ -930,6 +961,10 @@ def cmd_claim(cfg, args):
     내 것이 아니면 물러난다. 원자적이지는 않지만, 진 쪽이 스스로 알아차린다.
     """
     me = whoami(cfg, args.as_)
+    if role_of(cfg, me) == COORDINATOR and not args.force:
+        die("조율자는 작업에 착수하지 않습니다. 담당 디렉터리가 없어 고칠 자리가 없습니다.\n"
+            "  코드 변경이 필요하면 담당 세션에 메시지로 요청하세요.\n"
+            "  조율자가 할 일은 deputy next 가 알려줍니다.")
     iss = issue(args.number)
     v = consensus(cfg, iss)
     if v["decision"] not in ("CLAIM", "ESCALATE") and not args.force:
@@ -1017,6 +1052,97 @@ def cmd_done(cfg, args):
     print("\n멈추지 마세요. `deputy next` 로 다음 할 일을 확인하세요.")
 
 
+def next_for_coordinator(cfg, me, full, active, out):
+    """
+    조율자는 구현하지 않는다. 담당 디렉터리가 없으므로 코드를 고칠 자리도 없다.
+    대신 아무도 보지 않는 것을 본다 - 제안들 사이의 충돌, 정체된 작업, 무주지, 빈 백로그.
+    """
+    # 1순위: 내 리뷰. 조율자의 본업이다.
+    owed = []
+    for num, d in full.items():
+        if "deputy:next" not in label_names(d):
+            continue
+        cs = deputy_comments(d)
+        props = [c for c in cs if c["kind"] == "propose"]
+        if not props or props[-1]["by"] == me:
+            continue
+        pr = props[-1]
+        if not any(c["kind"] == "review" and c["by"] == me and c["rev"] == pr["rev"] for c in cs):
+            owed.append((d, pr))
+    if owed:
+        out.append("[1순위] 검토할 제안이 있습니다. 조율자의 본업입니다.")
+        for d, pr in owed:
+            out.append(f"  · #{d['number']} (rev{pr['rev']}, 제안자 {pr['by']}) {d['title']}")
+            out.append(f"    {d['url']}")
+        out.append("    담당자는 자기 영역만 봅니다. 당신은 전체를 봅니다. 이걸 확인하세요:")
+        out.append("      · 지금 진행 중인 다른 작업과 충돌하는가")
+        out.append("      · 순서가 맞는가. 먼저 해야 할 게 있지 않은가")
+        out.append("      · 담당 밖(무주지) 파일을 건드리려 하는가")
+        out.append("      · 완료 기준이 정말 검증 가능한가")
+        out.append('    → deputy review <번호> --verdict AGREE|OBJECT|AMEND --reason "..."')
+        out.append("")
+
+    # 2순위: 중재. 합의가 깨진 것들.
+    blocked = [d for n, d in full.items() if "deputy:blocked" in label_names(d)]
+    if blocked:
+        out.append("[2순위] 합의가 깨진 이슈가 있습니다. 중재가 필요합니다.")
+        for d in blocked:
+            out.append(f"  · #{d['number']} {d['title']}")
+            for c in deputy_comments(d):
+                if c["kind"] == "review" and c["verdict"] != "AGREE":
+                    txt = MARK.sub("", c["body"]).strip().replace("\n", " ")
+                    out.append(f"    ← {c['by']} ({c['verdict']}): {txt[:200]}")
+        out.append("    → 양쪽 근거를 읽고 이슈에 판단을 남기세요. 범위를 어떻게 좁힐지,")
+        out.append("      아니면 둘로 쪼갤지 정하고 그 이유를 씁니다.")
+        out.append('      deputy note <번호> "조율 판단: ..."')
+        out.append("")
+
+    # 3순위: 전체 그림. 조율자만 볼 수 있는 것.
+    wip = [d for n, d in full.items() if "deputy:wip" in label_names(d)]
+    open_props = [d for n, d in full.items() if "deputy:next" in label_names(d)]
+    if wip or open_props:
+        out.append("[3순위] 전체 현황을 점검하세요. 이걸 보는 건 당신뿐입니다.")
+        if wip:
+            out.append("  진행 중:")
+            for d in wip:
+                cs = deputy_comments(d)
+                who = next((c["by"] for c in reversed(cs) if c["kind"] == "claim"), "?")
+                last = max((c["at"] for c in cs), default=0)
+                idle = (time.time() - last) / 3600 if last else 0
+                flag = f"  [{idle:.1f}시간째 무소식]" if idle > 2 else ""
+                out.append(f"    · #{d['number']} {d['title'][:44]} ← {who}{flag}")
+        if open_props:
+            out.append("  검토 대기:")
+            for d in open_props:
+                out.append(f"    · #{d['number']} {d['title'][:44]}")
+        out.append("    확인할 것:")
+        out.append("      · 두 작업이 같은 파일을 건드리려 하는가 → 해당 세션에 알린다")
+        out.append("      · 오래 멈춰 있는 작업이 있는가 → 담당 세션에 상황을 묻는다")
+        out.append("      · 순서가 뒤집힌 게 있는가 → 이슈에 지적한다")
+        out.append("")
+
+    # 4순위: 백로그 관리. 구현 대신 이걸 한다.
+    cand = [i for i in active if not (label_names(i) & set(LABELS)) and not i["assignees"]]
+    if not out:
+        out.append("[4순위] 급한 게 없습니다. 백로그를 손보세요.")
+        out.append("")
+        if len(cand) < 3:
+            out.append(f"  후보 이슈가 {len(cand)}건뿐입니다. 세션들이 곧 할 일을 잃습니다.")
+            out.append("  코드를 읽고 다음 작업을 발굴해 이슈로 등록하세요:")
+            out.append('    gh issue create --title "..." --body "왜 필요한지와 완료 기준"')
+        else:
+            out.append(f"  후보 이슈 {len(cand)}건:")
+            for i in cand[:10]:
+                out.append(f"    · #{i['number']} {i['title']}")
+            out.append("  확인할 것:")
+            out.append("    · 너무 커서 한 번에 못 끝낼 이슈가 있는가 → 쪼갠다")
+            out.append("    · 근거나 완료 기준이 없는 이슈가 있는가 → 코멘트로 채운다")
+            out.append("    · 지금 우선순위가 틀린 게 있는가 → 이슈에 의견을 남긴다")
+        out.append("")
+        out.append("  구현하지 마세요. 담당 디렉터리가 없습니다.")
+        out.append("  코드를 고쳐야 한다면 담당 세션에 메시지로 요청하세요.")
+
+
 def cmd_next(cfg, args):
     """
     이 도구의 심장. 세션은 매 턴 이걸 실행하고 나온 지시를 그대로 따른다.
@@ -1028,7 +1154,8 @@ def cmd_next(cfg, args):
     """
     me = whoami(cfg, args.as_)
     mc = member_cfg(cfg, me)
-    print(f"=== deputy next :: {me} ===")
+    role = "조율자" if role_of(cfg, me) == COORDINATOR else "담당자"
+    print(f"=== deputy next :: {me} ({role}) ===")
     if mc.get("brief"):
         print(f"역할: {mc['brief']}")
     if mc.get("owns"):
@@ -1047,6 +1174,28 @@ def cmd_next(cfg, args):
             full[i["number"]] = d
 
     out = []
+    if role_of(cfg, me) == COORDINATOR:
+        if skipped:
+            out.append(f"[안내] 조회 실패로 건너뛴 이슈: " + ", ".join(f"#{n}" for n in skipped))
+            out.append("")
+        # 0순위(사람 코멘트)는 역할과 무관하게 먼저 본다
+        human = []
+        for num, d in full.items():
+            cs = deputy_comments(d)
+            last_bot = cs[-1]["at"] if cs else 0
+            for c in human_comments_since(d, last_bot):
+                human.append((d, c))
+        if human:
+            out.append("[0순위] 사람이 코멘트를 남겼습니다. 다른 무엇보다 먼저 반영하세요.")
+            for d, c in human:
+                out.append(f"  · #{d['number']} {d['title']}")
+                out.append(f"    \"{c['body'].strip()[:260]}\"")
+            out.append("    → 지시대로 조율하고, 이슈에 어떻게 반영했는지 코멘트로 답하세요.")
+            out.append("")
+        next_for_coordinator(cfg, me, full, active, out)
+        print("\n".join(out))
+        return
+
     if skipped:
         out.append(f"[안내] 조회 실패로 이번 턴에 건너뛴 이슈: "
                    + ", ".join(f"#{n}" for n in skipped))
@@ -1253,12 +1402,20 @@ def cmd_doctor(cfg, args):
         else "열린 이슈가 없습니다 → 세션이 할 일을 못 찾습니다. 이슈를 먼저 만드세요")
 
     seen = {}
+    if not coordinators(cfg):
+        warn.append("조율자가 없습니다 → 제안 사이의 충돌과 우선순위를 볼 사람이 없습니다 "
+                    "(deputy init 이 기본으로 넣어줍니다)")
     for m in cfg["members"]:
+        if m.get("role") == COORDINATOR:
+            if m.get("owns"):
+                bad.append(f"조율자 '{m['name']}' 에게 owns 가 있습니다 → 조율자는 구현하지 "
+                           f"않습니다. owns 를 비우세요")
+            continue
         if not m.get("owns"):
             warn.append(f"'{m['name']}' 의 owns 가 비어 있습니다 → 파일 충돌 위험")
         if not m.get("brief"):
             warn.append(f"'{m['name']}' 의 brief 가 비어 있습니다 → 제안 품질이 떨어집니다")
-        for d in m.get("owns", []):
+        for d in (m.get("owns", []) if m.get("role") != COORDINATOR else []):
             if d in seen:
                 bad.append(f"담당 겹침: '{d}' 를 {seen[d]} 와 {m['name']} 가 함께 소유")
             seen[d] = m["name"]
@@ -1322,14 +1479,17 @@ def main():
     s.add_argument("--member", action="append", help="이름:담당디렉터리,쉼표:역할설명")
     s.add_argument("--force", action="store_true", help="기존 멤버 설정을 덮어쓴다")
     s.add_argument("--members", type=int, default=2, metavar="N",
-                   help="자동 감지 시 만들 멤버 수 (기본 2). --member 를 주면 무시된다")
+                   help="자동 감지 시 만들 담당자 수 (기본 2). 조율자는 별도로 추가된다")
+    s.add_argument("--no-coordinator", dest="coordinator", action="store_false",
+                   help="전체를 조율하는 멤버를 만들지 않는다")
     s.add_argument("--no-skills", dest="skills", action="store_false",
                    help="스킬 복사를 건너뛴다 (플러그인으로 설치한 경우)")
     s.add_argument("--no-settings", dest="settings", action="store_false",
                    help="프로젝트 설정 병합을 건너뛴다")
     s.add_argument("--no-user-settings", dest="user_settings", action="store_false",
                    help="개인 설정 병합을 건너뛴다")
-    s.set_defaults(fn=cmd_init, needs_cfg=False, skills=True, settings=True, user_settings=True)
+    s.set_defaults(fn=cmd_init, needs_cfg=False, skills=True, settings=True,
+                   user_settings=True, coordinator=True)
 
     s = add("self-install", "deputy 를 PATH 에 심볼릭 링크로 올린다", """
   deputy self-install --prefix ~/.local/bin
@@ -1347,8 +1507,10 @@ def main():
   tests/api 는 src/api 에 자동으로 붙는다.
 """)
     s.add_argument("--members", type=int, default=2, metavar="N",
-                   help="제안할 멤버 수 (기본 2)")
-    s.set_defaults(fn=cmd_scan, needs_cfg=False)
+                   help="제안할 담당자 수 (기본 2). 조율자는 별도로 추가된다")
+    s.add_argument("--no-coordinator", dest="coordinator", action="store_false",
+                   help="전체를 조율하는 멤버를 만들지 않는다")
+    s.set_defaults(fn=cmd_scan, needs_cfg=False, coordinator=True)
 
     s = add("next", "지금 무엇을 해야 하는지 (매 턴 실행)", """
   deputy next
