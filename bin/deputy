@@ -1331,7 +1331,15 @@ def cmd_done(cfg, args):
             print(f"  파생이 모두 닫혔습니다. 이제 #{parent} 을 닫을 수 있습니다:")
             print(f"    deputy done {parent} --close --result \"...\"")
 
-    print("\n멈추지 마세요. `deputy next` 로 다음 할 일을 확인하세요.")
+    if args.no_next:
+        print("\n멈추지 마세요. `deputy next` 로 다음 할 일을 확인하세요.")
+        return
+
+    # 여기서 끊기면 세션이 한 턴을 그냥 흘려보낸다. 바로 다음 할 일까지 이어준다.
+    print("\n" + "─" * 70)
+    ISSUE_CACHE.clear()
+    nxt = argparse.Namespace(as_=args.as_, cmd="next")
+    cmd_next(cfg, nxt)
 
 
 def next_for_coordinator(cfg, me, full, active, out):
@@ -1424,7 +1432,9 @@ def next_for_coordinator(cfg, me, full, active, out):
         out.append("")
 
     # 4순위: 백로그 관리. 구현 대신 이걸 한다.
-    cand = [i for i in active if not (label_names(i) & set(LABELS)) and not i["assignees"]]
+    cand = sorted([i for i in active
+                   if not (label_names(i) & set(LABELS)) and not i["assignees"]],
+                  key=lambda x: x["number"])
     if not out:
         out.append("[4순위] 급한 게 없습니다. 백로그를 손보세요.")
         out.append("")
@@ -1530,6 +1540,7 @@ def cmd_next(cfg, args):
         pr = props[-1]
         if not any(c["kind"] == "review" and c["by"] == me and c["rev"] == pr["rev"] for c in cs):
             owed.append((d, pr))
+    owed.sort(key=lambda t: t[0]["number"])
     if owed:
         out.append("[1순위] 다른 세션이 당신의 리뷰를 기다립니다. 이게 최우선입니다.")
         for d, pr in owed:
@@ -1553,7 +1564,7 @@ def cmd_next(cfg, args):
         if mine:
             mine_wip.append((d, derived))
     if mine_wip:
-        mine_wip.sort(key=lambda x: (not x[1], x[0]["number"]))   # 파생 먼저, 그다음 번호순
+        mine_wip.sort(key=lambda x: (not x[1], x[0]["number"]))  # 파생 먼저, 그다음 번호순   # 파생 먼저, 그다음 번호순
         out.append("[2순위] 진행 중인 작업이 있습니다. 새 일을 벌이기 전에 끝내세요.")
         for d, derived in mine_wip:
             tag = f"  (부모 #{parent_of(d)} 의 파생 — 이걸 닫아야 부모가 닫힙니다)" if derived else ""
@@ -1581,6 +1592,8 @@ def cmd_next(cfg, args):
             if dep is None or dep.get("state") == "OPEN":
                 unmet.append(a)
         (blocked_mine if unmet else planned_mine).append((d, meta, unmet))
+    planned_mine.sort(key=lambda t: t[0]["number"])
+    blocked_mine.sort(key=lambda t: t[0]["number"])
     if planned_mine:
         out.append("[2순위] 계획으로 배정된 작업이 있습니다. 이미 합의된 것이라 바로 착수합니다.")
         for d, meta, _ in planned_mine:
@@ -1636,8 +1649,9 @@ def cmd_next(cfg, args):
             out.append("  · 재현 케이스나 실패하는 테스트를 먼저 써둔다")
             out.append("  · 알아낸 것을 deputy note 로 이슈에 남긴다 (사람이 폰으로 읽습니다)")
         else:
-            cand = [i for i in active
-                    if not (label_names(i) & set(LABELS)) and not i["assignees"]]
+            cand = sorted([i for i in active
+                           if not (label_names(i) & set(LABELS)) and not i["assignees"]],
+                          key=lambda x: x["number"])
             out.append("[새 작업] 막고 있는 것도 진행 중인 것도 없습니다. 다음 작업을 제안하세요.")
             out.append("")
             if cand:
@@ -2112,6 +2126,8 @@ def main_parser():
     s.add_argument("number", type=int, help="완료 처리할 이슈 번호")
     s.add_argument("--result", required=True, help="무엇을 했고 어떻게 검증했는지")
     s.add_argument("--close", action="store_true", help="이슈를 닫는다")
+    s.add_argument("--no-next", action="store_true",
+                   help="완료 후 다음 할 일을 이어서 보여주지 않는다")
     s.set_defaults(fn=cmd_done)
 
     s = add("note", "이슈에 메모를 남긴다", """
