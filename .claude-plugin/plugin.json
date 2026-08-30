@@ -1,0 +1,6 @@
+{
+  "name": "deputy",
+  "description": "여러 Claude Code 세션이 GitHub 이슈 위에서 토론하고 합의하며 무인으로 일하게 만든다",
+  "version": "0.1.0",
+  "author": { "name": "KimGungeon" }
+}

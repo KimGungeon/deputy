@@ -1,0 +1,11 @@
+{
+  "name": "deputy-kit",
+  "owner": { "name": "KimGungeon" },
+  "plugins": [
+    {
+      "name": "deputy",
+      "source": "./",
+      "description": "여러 Claude Code 세션이 GitHub 이슈 위에서 토론하고 합의하며 무인으로 일하게 만든다"
+    }
+  ]
+}

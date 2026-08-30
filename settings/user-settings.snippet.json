@@ -1,0 +1,15 @@
+{
+  "_주석": "~/.claude/settings.json 에 병합하세요. 기존 hooks 블록은 건드리지 말 것.",
+
+  "autoContinueAtUsageLimit": true,
+  "crossSessionInbound": "accept",
+  "dialogExpiry": "never",
+  "cleanupPeriodDays": 90,
+  "subagentPromptCacheTtl": "1h",
+
+  "worktree": { "baseRef": "head" },
+
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"
+  }
+}
