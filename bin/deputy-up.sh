@@ -116,6 +116,17 @@ EOF
 EOF
   fi
 
+  # /goal 로 감싼다. 이게 없으면 세션이 한 턴만 돌고 멈춘다.
+  # 조건은 대화에 드러난 것만으로 판정 가능해야 한다 - 판정 모델은 도구를 못 쓴다.
+  GOAL="/goal deputy next 가 후보 이슈 없음을 보고했고, 내가 착수한 이슈가 모두 닫혔다."
+  GOAL="$GOAL 매 턴 반드시 deputy next 를 먼저 실행하고 그 출력의 지시를 그대로 따른다."
+  GOAL="$GOAL 무엇을 할지 스스로 정하지 않는다. 담당 디렉터리 밖의 파일을 수정하지 않는다."
+  GOAL="$GOAL main 으로 push 하지 않고 배포와 마이그레이션을 하지 않는다."
+  GOAL="$GOAL 막히면 deputy note 로 이슈에 남기고 다음 할 일로 넘어간다. ${MAX_TURNS:-60}턴을 넘기면 중단한다."
+  PROMPT="$PROMPT
+
+$GOAL"
+
   echo "  → $M ($ROLE) 기동 중..."
   DEPUTY_MEMBER="$M" claude --bg --name "deputy-$M" "$PROMPT" >/dev/null 2>&1 || {
     echo "     실패. 수동으로 실행하세요:"
