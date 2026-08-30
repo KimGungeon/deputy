@@ -38,6 +38,13 @@ WORKFLOW = """
   세션은 매 턴 `deputy next` 를 실행하고, 나온 지시를 그대로 따른다.
   무엇을 할지 스스로 정하지 않는다.
 
+  이슈 하나를 지목해 처리하려면 번호만 주면 된다.
+
+    deputy 7        #7 에 대해 지금 할 일을 판단한다.
+                    착수·분해안 적용처럼 인자가 필요 없는 행동은 바로 실행하고,
+                    제안·리뷰·완료처럼 판단이 필요한 것은 명령을 출력한다.
+    deputy 7 --dry  실행하지 않고 무엇을 할지만 본다.
+
     deputy next
       │
       ├─ 리뷰 요청이 와 있다 ──→ deputy review <n> --verdict AGREE|OBJECT|AMEND
@@ -354,7 +361,8 @@ def consensus(cfg, iss):
     사람이 없는 8시간 동안 '합의를 기다리며 정지'가 가장 나쁜 결과이기 때문이다.
     """
     cs = deputy_comments(iss)
-    props = [c for c in cs if c["kind"] == "propose"]
+    # 분해안(plan)도 제안과 똑같이 합의를 거친다. 둘 다 rev 를 달고 있어 리뷰가 붙는다.
+    props = [c for c in cs if c["kind"] in ("propose", "plan")]
     if not props:
         return {"decision": "NONE", "reason": "아직 제안되지 않은 이슈입니다.", "detail": {}}
 
@@ -1371,6 +1379,26 @@ def next_for_coordinator(cfg, me, full, active, out):
         out.append('      deputy note <번호> "조율 판단: ..."')
         out.append("")
 
+    # 2.5순위: 내가 올린 분해안의 판정
+    for num, d in full.items():
+        cs = deputy_comments(d)
+        plans = [c for c in cs if c["kind"] == "plan"]
+        if not plans or plans[-1]["by"] != me or children_of(d):
+            continue
+        v = consensus(cfg, d)
+        if v["decision"] in ("CLAIM", "ESCALATE"):
+            out.append(f"[2순위] 내 분해안 #{num} 이 합의됐습니다 ({v['decision']}).")
+            out.append(f"    → deputy plan {num} --apply   (자식 이슈를 생성한다)")
+            out.append("")
+        elif v["decision"] == "REVISE":
+            out.append(f"[2순위] 내 분해안 #{num} 에 이견이 있습니다.")
+            for c in cs:
+                if c["kind"] == "review" and c["rev"] == plans[-1]["rev"] and c["verdict"] != "AGREE":
+                    txt = MARK.sub("", c["body"]).strip().replace("\n", " ")
+                    out.append(f"    ← {c['by']} ({c['verdict']}): {txt[:220]}")
+            out.append(f"    → 고쳐서 다시: deputy plan {num} --file plan.json")
+            out.append("")
+
     # 3순위: 전체 그림. 조율자만 볼 수 있는 것.
     wip = [d for n, d in full.items() if "deputy:wip" in label_names(d)]
     open_props = [d for n, d in full.items() if "deputy:next" in label_names(d)]
@@ -1632,6 +1660,171 @@ def cmd_next(cfg, args):
     print("\n".join(out))
 
 
+# ---------------------------------------------------------------- 통합 진입점
+
+def decide_action(cfg, me, iss):
+    """
+    이 이슈에 대해 지금 내가 할 일을 판단한다. 순수 함수라 네트워크를 타지 않는다.
+
+    반환: (종류, 설명줄들, 자동실행할 인자들 또는 None)
+      자동 실행은 '인자 없이 결정되는 행동'만 한다. 판단이 필요한 것(제안·리뷰·완료)은
+      바로 붙여넣을 수 있는 명령을 대신 출력한다.
+    """
+    num = iss["number"]
+    labels = label_names(iss)
+    cs = deputy_comments(iss)
+    props = [c for c in cs if c["kind"] == "propose"]
+    plans = [c for c in cs if c["kind"] == "plan"]
+    claims = [c for c in cs if c["kind"] == "claim"]
+    meta = planned_meta(iss)
+    role = role_of(cfg, me)
+    L = []
+
+    if iss.get("state") != "OPEN":
+        return "closed", ["이미 닫힌 이슈입니다."], None
+
+    # 에픽 — 자식 진행 상황을 본다
+    if "deputy:epic" in labels:
+        kids = children_of(iss)
+        openk = open_children(iss)
+        L.append(f"에픽입니다. 자식 {len(kids)}건 중 {len(kids)-len(openk)}건 완료.")
+        if openk:
+            L.append(f"  열린 자식: {', '.join('#'+str(k) for k in openk)}")
+            L.append("  에픽은 자식이 모두 닫혀야 닫힙니다. deputy next 로 다음 자식을 받으세요.")
+            return "epic-open", L, None
+        L.append("  자식이 모두 닫혔습니다. 에픽을 닫을 수 있습니다:")
+        L.append(f'    deputy done {num} --close --result "에픽 완료: 무엇을 이뤘는지"')
+        return "epic-done", L, None
+
+    # 분해안이 올라와 있는 경우
+    if plans and not children_of(iss):
+        v = consensus(cfg, iss)
+        if v["decision"] in ("CLAIM", "ESCALATE"):
+            L.append(f"분해안이 합의됐습니다 ({v['decision']}). 자식 이슈를 생성합니다.")
+            return "plan-apply", L, ["plan", str(num), "--apply"]
+        if v["decision"] == "REVISE":
+            L.append(f"분해안에 이견이 있습니다. {v['reason']}")
+            for c in cs:
+                if c["kind"] == "review" and c["rev"] == plans[-1]["rev"] and c["verdict"] != "AGREE":
+                    txt = MARK.sub("", c["body"]).strip().replace("\n", " ")
+                    L.append(f"  ← {c['by']} ({c['verdict']}): {txt[:220]}")
+            L.append(f"  고쳐서 다시 제출하세요:  deputy plan {num} --file plan.json")
+            return "plan-revise", L, None
+        if plans[-1]["by"] != me and not any(
+                c["kind"] == "review" and c["by"] == me and c["rev"] == plans[-1]["rev"] for c in cs):
+            L.append("분해안을 검토해야 합니다. 이 판단이 실행 전체의 방향을 정합니다.")
+            L.append("  담당이 실제로 갈리는가 / 순서가 맞는가 / 완료 기준이 검증 가능한가")
+            L.append(f'  deputy review {num} --verdict AGREE|OBJECT|AMEND --reason "..."')
+            return "plan-review", L, None
+        L.append(f"분해안 검토 대기 중입니다. {v['reason']}")
+        return "plan-wait", L, None
+
+    # 계획으로 배정된 자식
+    if meta:
+        if meta["owner"] != me:
+            L.append(f"이 작업은 {meta['owner']} 에게 배정됐습니다 (에픽 #{meta['parent']}).")
+            return "not-mine", L, None
+        if claims:
+            L.append(f"이미 착수했습니다. 끝나면:")
+            L.append(f'  deputy done {num} --close --result "무엇을 했고 어떻게 검증했는지"')
+            L.append(f'  작업 중 부모의 완료 기준을 위협하는 문제를 발견하면:')
+            L.append(f'  deputy derive {num} --why "..." --blocks "..." --done-when "..."')
+            return "mine-wip", L, None
+        L.append(f"계획으로 내게 배정된 작업입니다 (에픽 #{meta['parent']}). 재합의 불필요.")
+        return "planned-claim", L, ["claim", str(num)]
+
+    # 일반 제안 흐름
+    if not props:
+        if role == COORDINATOR:
+            L.append("아직 제안되지 않았습니다. 조율자는 제안 대신 분해를 검토합니다.")
+            L.append("  이 이슈가 한 번에 끝낼 수 없을 만큼 크면 분해하세요:")
+            L.append(f"    deputy plan --template   후  deputy plan {num} --file plan.json")
+            return "coord-idle", L, None
+        L.append("아직 제안되지 않았습니다. 크기를 먼저 판단하세요.")
+        L.append("  한 번에 끝낼 수 있다 → 제안:")
+        L.append(f'    deputy propose {num} --why "왜 지금 이것인지" \\')
+        L.append(f'      --alternatives "다른 후보를 왜 미뤘는지" \\')
+        L.append(f'      --done-when "무엇이 참이면 끝인지 (명령과 기대 출력으로)"')
+        L.append("  너무 크다 → 분해:")
+        L.append(f"    deputy plan --template   후  deputy plan {num} --file plan.json")
+        return "propose", L, None
+
+    p = props[-1]
+    v = consensus(cfg, iss)
+
+    if claims:
+        owner = claims[0]["by"]
+        if owner != me:
+            L.append(f"{owner} 가 {stamp(claims[0]['at'])} 에 착수해 진행 중입니다.")
+            L.append("  건드리지 마세요. deputy next 로 내 할 일을 받으세요.")
+            return "other-wip", L, None
+        L.append("내가 착수한 작업입니다.")
+        L.append(f'  끝나면: deputy done {num} --close --result "무엇을 했고 어떻게 검증했는지"')
+        L.append(f'  문제 발견: deputy derive {num} --why "..." --blocks "..." --done-when "..."')
+        return "mine-wip", L, None
+
+    if p["by"] != me:
+        done = any(c["kind"] == "review" and c["by"] == me and c["rev"] == p["rev"] for c in cs)
+        if not done:
+            L.append(f"{p['by']} 의 제안(rev{p['rev']})을 검토해야 합니다.")
+            L.append("  제안이 건드린다는 파일을 실제로 읽고 판단하세요.")
+            if role == COORDINATOR:
+                L.append("  조율자는 전체 관점을 봅니다: 다른 작업과 충돌하는가, 순서가 맞는가.")
+            L.append(f'  deputy review {num} --verdict AGREE|OBJECT|AMEND --reason "확인한 것과 우려"')
+            return "review", L, None
+        L.append(f"이미 검토했습니다. 현재 판정: {v['decision']} — {v['reason']}")
+        return "reviewed", L, None
+
+    # 내 제안
+    if v["decision"] in ("CLAIM", "ESCALATE"):
+        L.append(f"내 제안이 합의됐습니다 ({v['decision']}). {v['reason']}")
+        if role == COORDINATOR:
+            L.append("  다만 조율자는 착수하지 않습니다. 담당 세션에 요청하세요.")
+            return "coord-cant-claim", L, None
+        return "claim", L, ["claim", str(num)]
+    if v["decision"] == "REVISE":
+        L.append(f"내 제안에 이견이 있습니다. {v['reason']}")
+        for c in cs:
+            if c["kind"] == "review" and c["rev"] == p["rev"] and c["verdict"] != "AGREE":
+                txt = MARK.sub("", c["body"]).strip().replace("\n", " ")
+                L.append(f"  ← {c['by']} ({c['verdict']}): {txt[:220]}")
+        L.append(f'  고쳐서 다시: deputy propose {num} --why "이견을 이렇게 반영했다" --done-when "..."')
+        return "revise", L, None
+    L.append(f"리뷰 대기 중입니다. {v['reason']}")
+    L.append("  멈추지 마세요. 관련 코드를 읽고 실패하는 테스트를 먼저 써두면")
+    L.append("  합의 직후 바로 구현에 들어갈 수 있습니다.")
+    return "wait", L, None
+
+
+def cmd_at(cfg, args):
+    """deputy <이슈번호> — 이 이슈에 대해 지금 할 일을 판단하고, 자명한 것은 바로 실행한다."""
+    me = whoami(cfg, args.as_)
+    iss = issue(args.number)
+
+    labels = ", ".join(sorted(label_names(iss))) or "라벨 없음"
+    assignee = iss["assignees"][0]["login"] if iss.get("assignees") else "없음"
+    print(f"#{iss['number']}  {iss['title']}")
+    print(f"  상태 {iss['state']}  ·  {labels}  ·  배정 {assignee}")
+    print(f"  {iss['url']}")
+    print(f"  나: {me} ({'조율자' if role_of(cfg, me) == COORDINATOR else '담당자'})")
+    print()
+
+    kind, lines, auto = decide_action(cfg, me, iss)
+    for l in lines:
+        print(l)
+
+    if not auto:
+        return
+    if args.dry:
+        print(f"\n[--dry] 자동 실행할 명령: deputy {' '.join(auto)}")
+        return
+
+    print(f"\n→ 자동 실행: deputy {' '.join(auto)}\n")
+    sub_args = main_parser().parse_args(auto)
+    sub_args.as_ = args.as_
+    sub_args.fn(cfg, sub_args)
+
+
 def cmd_status(cfg, args):
     print(f"=== deputy status ===  멤버: {', '.join(members(cfg))}\n")
     tracked = [i for i in list_issues(limit=60) if label_names(i) & set(LABELS)]
@@ -1758,7 +1951,7 @@ def cmd_doctor(cfg, args):
 
 # ---------------------------------------------------------------- 진입점
 
-def main():
+def main_parser():
     ap = argparse.ArgumentParser(
         prog="deputy", description=__doc__, epilog=WORKFLOW,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1943,7 +2136,39 @@ def main():
 """)
     s.set_defaults(fn=cmd_doctor)
 
-    args = ap.parse_args()
+    s = add("at", "이슈 번호 하나로 지금 할 일을 판단한다 (deputy <번호> 와 같다)", """
+  deputy 7            #7 에 대해 지금 할 일을 판단하고 자명한 것은 바로 실행
+  deputy 7 --dry      실행하지 않고 무엇을 할지만 본다
+
+  인자가 필요 없는 행동(착수, 분해안 적용)은 자동으로 실행한다.
+  판단이 필요한 행동(제안, 리뷰, 완료)은 붙여넣을 명령을 출력한다.
+""")
+    s.add_argument("number", type=int, help="이슈 번호")
+    s.add_argument("--dry", action="store_true", help="실행하지 않고 보여만 준다")
+    s.set_defaults(fn=cmd_at)
+
+    return ap
+
+
+def main():
+    # `deputy 7` 을 `deputy at 7` 로 바꿔준다
+    # 전역 플래그를 건너뛴 뒤 첫 토큰이 숫자면 at 명령으로 본다
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--as":
+            i += 2
+            continue
+        if tok.startswith("--as="):
+            i += 1
+            continue
+        if tok.isdigit():
+            argv = argv[:i] + ["at"] + argv[i:]
+        break
+
+    ap = main_parser()
+    args = ap.parse_args(argv)
 
     if not args.cmd:
         # 인자 없이 부르면 지금 상태에 맞는 다음 한 걸음을 알려준다
