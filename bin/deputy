@@ -1947,15 +1947,24 @@ def session_states(cfg):
             rows = d if isinstance(d, list) else d.get("agents", d.get("sessions", []))
         except Exception:
             rows = []
+    # 같은 이름이 여러 번 나올 수 있다. 재기동해도 죽은 항목이 목록에 남기 때문이다.
+    # 살아 있는 것(pid 가 있는 것)을 우선한다. 그러지 않으면 멀쩡히 도는 세션을
+    # 죽었다고 판단해 계속 재기동하는 무한 루프에 빠진다.
     by_name = {}
     for a in rows:
         n = str(a.get("name") or "")
-        if n.startswith("deputy-"):
-            by_name[n[len("deputy-"):]] = {
-                "status": a.get("status") or a.get("state") or "?",
-                "id": a.get("sessionId") or a.get("id"),
-                "pid": a.get("pid"),
-            }
+        if not n.startswith("deputy-"):
+            continue
+        m = n[len("deputy-"):]
+        cur = {
+            "status": a.get("status") or a.get("state"),
+            "id": a.get("sessionId") or a.get("id"),
+            "pid": a.get("pid"),
+        }
+        prev = by_name.get(m)
+        if prev is None or (prev.get("pid") is None and cur.get("pid") is not None):
+            by_name[m] = cur
+        by_name.setdefault(m, cur)
     return {m: by_name.get(m) for m in members(cfg)}
 
 
@@ -1996,6 +2005,8 @@ def cmd_watch(cfg, args):
             reason = "세션 없음"
         elif st["status"] in revive_states:
             reason = f"상태 {st['status']}"
+        elif st["status"] is None:
+            reason = "상태 없음(종료된 기록)"
         elif st["pid"] is None:
             reason = "프로세스 죽음"
         else:
