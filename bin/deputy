@@ -1996,6 +1996,47 @@ def gh_free(argv, timeout=30):
         return None
 
 
+AUTH_HINTS = ("login required", "not logged in", "please run /login", "authentication")
+
+
+def job_details():
+    """
+    슈퍼바이저가 남긴 잡 상태 파일에서 세션별 사유를 읽는다.
+    claude agents --json 은 status 만 주고 '왜' 를 주지 않는다.
+    리밋과 인증 만료가 둘 다 blocked 로 보이므로 이 파일을 봐야 구분된다.
+    """
+    out = {}
+    base = os.path.join(HOME, ".claude", "jobs")
+    if not os.path.isdir(base):
+        return out
+    for jid in os.listdir(base):
+        d = read_json(os.path.join(base, jid, "state.json"))
+        if not d:
+            continue
+        n = str(d.get("name") or "")
+        if not n.startswith("deputy-"):
+            continue
+        m = n[len("deputy-"):]
+        upd = str(d.get("updatedAt") or "")
+        prev = out.get(m)
+        if prev is None or upd > prev["updatedAt"]:
+            out[m] = {
+                "updatedAt": upd,
+                "state": d.get("state"),
+                "detail": str(d.get("detail") or ""),
+                "needs": str(d.get("needs") or ""),
+            }
+    return out
+
+
+def auth_problem(info):
+    """이 세션이 인증 때문에 막힌 것인가. 그렇다면 재기동해도 소용없다."""
+    if not info:
+        return None
+    blob = (info.get("needs", "") + " " + info.get("detail", "")).lower()
+    return blob.strip() if any(h in blob for h in AUTH_HINTS) else None
+
+
 def watch_state_path():
     d = os.path.join(HOME, ".deputy")
     os.makedirs(d, exist_ok=True)
@@ -2028,8 +2069,9 @@ def cmd_watch(cfg, args):
     last = hist.get(key, {})
 
     states = session_states(cfg)
+    jobs = job_details()
     now = time.time()
-    acted, skipped = [], []
+    acted, skipped, auth_blocked = [], [], []
 
     print(f"=== deputy watch :: {os.path.basename(root)} ===  {stamp()}")
     for m, st in states.items():
@@ -2041,6 +2083,14 @@ def cmd_watch(cfg, args):
         started = (st or {}).get("startedAt") or 0
         if started and (now - started / 1000.0) < args.grace:
             print(f"  대기중  {m:<10} 기동 {int(now - started/1000.0)}초 경과 (유예 {args.grace}초)")
+            continue
+
+        # 인증이 풀렸으면 되살려도 똑같이 막힌다. 토큰만 태우므로 멈춘다.
+        auth = auth_problem(jobs.get(m))
+        if auth:
+            print(f"  STOP    {m:<10} 인증 문제 — 재기동해도 풀리지 않습니다")
+            print(f"          {auth[:90]}")
+            auth_blocked.append(m)
             continue
 
         why = "세션 없음" if st is None else f"상태 {st.get('status')!r}"
@@ -2070,6 +2120,12 @@ def cmd_watch(cfg, args):
     if not args.dry:
         hist[key] = last
         write_json(st_path, hist)
+
+    if auth_blocked:
+        print(f"\n  [사람이 필요합니다] {', '.join(auth_blocked)} 가 인증에서 막혔습니다.")
+        print("  Claude Code 프롬프트에 /login 을 입력해 다시 로그인한 뒤")
+        print("  deputy watch 를 다시 실행하세요. 그 전까지는 재기동하지 않습니다.")
+        return
 
     if not acted and not skipped:
         print("  전부 정상입니다.")
@@ -2229,6 +2285,13 @@ def cmd_doctor(cfg, args):
             if d in seen:
                 bad.append(f"담당 겹침: '{d}' 를 {seen[d]} 와 {m['name']} 가 함께 소유")
             seen[d] = m["name"]
+
+    for m, info in job_details().items():
+        a = auth_problem(info)
+        if a:
+            bad.append(f"세션 '{m}' 이 인증에서 막혀 있습니다 → /login 후 deputy watch "
+                       f"({a[:60]})")
+            break
 
     if subprocess.run(["pgrep", "-x", "caffeinate"], capture_output=True).returncode == 0:
         ok.append("F-01 caffeinate 실행 중")
