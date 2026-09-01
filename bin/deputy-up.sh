@@ -5,7 +5,15 @@
 # 하는 일: 점검 → 절전 차단 → 멤버별 백그라운드 세션 기동(목표 부착)
 set -euo pipefail
 
-PROJECT="${1:-$PWD}"
+ONLY=""
+PROJECT="$PWD"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) ONLY="$2"; shift 2 ;;
+    --only=*) ONLY="${1#*=}"; shift ;;
+    *) PROJECT="$1"; shift ;;
+  esac
+done
 cd "$PROJECT"
 
 # PATH 에 설치돼 있으면 그걸 쓰고, 아니면 이 스크립트 옆의 것을 쓴다
@@ -18,6 +26,12 @@ CFG=".deputy/deputy.json"
 
 [ -f "$CFG" ] || { echo "deputy-up: $PROJECT 에 .deputy/deputy.json 이 없습니다. 'deputy init' 을 먼저 실행하세요."; exit 1; }
 
+if [ -n "$ONLY" ]; then
+  MEMBERS_OVERRIDE="$ONLY"
+  QUIET=1
+fi
+
+if [ -z "${QUIET:-}" ]; then
 echo "=== 1/4 점검 ==="
 if ! "$DEPUTY" doctor; then
   echo
@@ -26,6 +40,9 @@ if ! "$DEPUTY" doctor; then
   [ "${DEPUTY_FORCE:-0}" = "1" ] || exit 1
 fi
 
+fi
+
+if [ -z "${QUIET:-}" ]; then
 echo
 echo "=== 2/4 절전 차단 ==="
 if pgrep -x caffeinate >/dev/null; then
@@ -35,9 +52,10 @@ else
   echo "  caffeinate 시작 (pid $!)"
 fi
 
-echo
-echo "=== 3/4 세션 기동 ==="
-MEMBERS=$(python3 -c "import json;print(' '.join(m['name'] for m in json.load(open('$CFG'))['members']))")
+fi
+
+[ -z "${QUIET:-}" ] && { echo; echo "=== 3/4 세션 기동 ==="; }
+MEMBERS="${MEMBERS_OVERRIDE:-$(python3 -c "import json;print(' '.join(m['name'] for m in json.load(open('$CFG'))['members']))")}"
 
 for M in $MEMBERS; do
   BRIEF=$(python3 -c "
@@ -109,7 +127,10 @@ EOF
 - 배포, 마이그레이션, 시크릿 조작
 - 이견이 남았는데 deputy claim --force 로 밀어붙이기
 
-막히면 멈추지 말고 \`deputy note <번호> "무엇에 막혔는지"\` 로 이슈에 남긴다.
+막혀도 절대 질문하고 멈추지 않는다. 사람이 없다. 질문은 아무도 못 읽는다.
+막히면 \`deputy note <번호> "무엇에 막혔는지"\` 로 이슈에 남기고 곧바로 \`deputy next\` 로 넘어간다.
+할 일이 하나도 없어 보여도 멈추지 않는다. 다른 세션의 제안을 리뷰하거나,
+담당 영역의 코드를 읽고 다음 작업 후보를 이슈로 등록하거나, 실패하는 테스트를 미리 써둔다.
 사람은 출근해 있고 폰으로 GitHub 이슈를 본다. 이슈 코멘트가 유일한 보고 채널이다.
 
 시작한다. 지금 바로 \`deputy next\` 를 실행하라.
@@ -134,6 +155,7 @@ $GOAL"
   }
 done
 
+if [ -n "${QUIET:-}" ]; then exit 0; fi
 echo
 echo "=== 4/4 완료 ==="
 echo "  세션 관제:  claude agents      (Ctrl+T 로 각 세션을 고정하세요 - F-03)"

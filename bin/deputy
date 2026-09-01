@@ -1023,6 +1023,18 @@ def validate_plan(cfg, plan, epic_num):
     if graph and all(graph.get(i) for i in graph):
         errs.append("모든 자식에 선행 작업이 있습니다. 처음 시작할 수 있는 게 없습니다.")
 
+    # 담당자마다 선행 없이 바로 시작할 수 있는 작업이 최소 하나 있어야 한다.
+    # 없으면 그 담당자는 처음부터 할 일이 없어 놀고, 무인 운영에서는 그 세션이
+    # 질문을 남기고 멈춰버린다. 실제로 그렇게 한 세션을 통째로 날린 적이 있다.
+    startable = {ch.get("owner") for ch in children
+                 if isinstance(ch, dict) and not ch.get("after")}
+    for b in builders:
+        if b in {ch.get("owner") for ch in children if isinstance(ch, dict)} and b not in startable:
+            errs.append(f"'{b}' 에게는 선행 없이 시작할 수 있는 작업이 없습니다. "
+                        f"그 세션은 처음부터 놀게 되고, 무인 운영에서는 멈춰버립니다. "
+                        f"{b} 담당 작업 중 하나를 선행 없이 시작할 수 있게 쪼개세요 "
+                        f"(예: 계약을 기다리지 않는 순수 로직이나 픽스처 준비).")
+
     owners = {ch.get("owner") for ch in children if isinstance(ch, dict)}
     if len(owners) == 1 and len(builders) > 1:
         errs.append(f"모든 작업을 {owners.pop()!r} 혼자 맡습니다. 병렬로 돌릴 이유가 없어집니다. "
@@ -1922,6 +1934,105 @@ def cmd_at(cfg, args):
     sub_args.fn(cfg, sub_args)
 
 
+def session_states(cfg):
+    """
+    claude agents 에서 이 프로젝트의 deputy 세션 상태를 읽는다.
+    상태 어휘: busy(일하는 중) / idle(대기) / blocked(입력 대기 또는 리밋) / 없음(죽음)
+    """
+    out = gh_free(["claude", "agents", "--json"])
+    rows = []
+    if out:
+        try:
+            d = json.loads(out)
+            rows = d if isinstance(d, list) else d.get("agents", d.get("sessions", []))
+        except Exception:
+            rows = []
+    by_name = {}
+    for a in rows:
+        n = str(a.get("name") or "")
+        if n.startswith("deputy-"):
+            by_name[n[len("deputy-"):]] = {
+                "status": a.get("status") or a.get("state") or "?",
+                "id": a.get("sessionId") or a.get("id"),
+                "pid": a.get("pid"),
+            }
+    return {m: by_name.get(m) for m in members(cfg)}
+
+
+def gh_free(argv, timeout=30):
+    """gh 가 아닌 임의 명령 실행. 실패해도 죽지 않는다."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def cmd_watch(cfg, args):
+    """
+    죽었거나 멈춘 세션을 되살린다.
+
+    이게 필요한 이유: 백그라운드 세션은 사용량 리밋에 걸리면 그냥 죽는다.
+    autoContinueAtUsageLimit 은 열려 있는 대화형 세션에만 적용되고,
+    문서상 백그라운드 세션과 -p 실행에는 대기 옵션 자체가 제공되지 않는다.
+    그래서 리밋에 걸린 무인 세션은 리셋이 와도 스스로 돌아오지 못한다.
+
+    되살리는 방식은 '복구'가 아니라 '새로 띄우기'다. 상태가 전부 GitHub 이슈에
+    있으므로 새 세션이 deputy next 로 곧바로 이어받는다. 40시간 묵은 컨텍스트를
+    되살리는 것보다 깨끗하다.
+    """
+    root = repo_root()
+    up = os.path.join(PKG_DIR, "bin", "deputy-up.sh")
+    if not os.path.exists(up):
+        die(f"{up} 을 찾을 수 없습니다.")
+
+    states = session_states(cfg)
+    revive_states = {"blocked", "failed", "stopped", "exited"}
+    acted = []
+
+    print(f"=== deputy watch :: {os.path.basename(root)} ===  {stamp()}")
+    for m, st in states.items():
+        if st is None:
+            reason = "세션 없음"
+        elif st["status"] in revive_states:
+            reason = f"상태 {st['status']}"
+        elif st["pid"] is None:
+            reason = "프로세스 죽음"
+        else:
+            print(f"  ok    {m:<10} {st['status']}")
+            continue
+
+        print(f"  살림  {m:<10} {reason}")
+        acted.append(m)
+        if args.dry:
+            continue
+        if st and st.get("id"):
+            gh_free(["claude", "stop", st["id"]], timeout=20)
+            gh_free(["claude", "rm", st["id"]], timeout=20)
+        r = subprocess.run(["bash", up, "--only", m], cwd=root,
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"        기동 실패: {(r.stderr or r.stdout).strip()[:160]}")
+
+    if not acted:
+        print("  전부 정상입니다.")
+    elif args.dry:
+        print(f"\n  [--dry] {len(acted)}개를 되살릴 예정이었습니다.")
+    else:
+        print(f"\n  {len(acted)}개 재기동했습니다.")
+
+    if args.loop:
+        print(f"\n  {args.loop}초 뒤 다시 점검합니다. Ctrl+C 로 중단.")
+        while True:
+            time.sleep(args.loop)
+            try:
+                cmd_watch(cfg, argparse.Namespace(as_=args.as_, loop=0, dry=args.dry, cmd="watch"))
+            except SystemExit:
+                pass
+            except Exception as e:
+                print(f"  점검 실패: {e}")
+
+
 def cmd_status(cfg, args):
     print(f"=== deputy status ===  멤버: {', '.join(members(cfg))}\n")
     tracked = [i for i in list_issues(limit=60) if label_names(i) & set(LABELS)]
@@ -2228,6 +2339,24 @@ def main_parser():
     s.add_argument("number", type=int, help="메모를 남길 이슈 번호")
     s.add_argument("text", help="메모 내용")
     s.set_defaults(fn=cmd_note)
+
+    s = add("watch", "죽었거나 멈춘 세션을 되살린다 (cron 으로 주기 실행)", """
+  deputy watch              한 번 점검하고 필요하면 재기동
+  deputy watch --dry        무엇을 할지만 본다
+  deputy watch --loop 600   600초마다 반복 (포그라운드)
+
+  백그라운드 세션은 사용량 리밋에 걸리면 그냥 죽는다.
+  autoContinueAtUsageLimit 은 열려 있는 대화형 세션에만 적용되고,
+  백그라운드 세션에는 대기 옵션 자체가 제공되지 않는다 (공식 문서).
+  그래서 밖에서 되살려 주지 않으면 리셋이 와도 돌아오지 못한다.
+
+  cron 예시 (10분마다):
+    */10 * * * * cd /path/to/repo && /path/to/deputy watch >> ~/.deputy-watch.log 2>&1
+""")
+    s.add_argument("--dry", action="store_true", help="재기동하지 않고 판단만 출력")
+    s.add_argument("--loop", type=int, default=0, metavar="SEC",
+                   help="지정한 초 간격으로 반복 점검한다")
+    s.set_defaults(fn=cmd_watch)
 
     s = add("status", "전체 현황", """
   deputy status
