@@ -2046,35 +2046,75 @@ def cmd_watch(cfg, args):
 
 def cmd_status(cfg, args):
     print(f"=== deputy status ===  멤버: {', '.join(members(cfg))}\n")
-    tracked = [i for i in list_issues(limit=60) if label_names(i) & set(LABELS)]
-    if not tracked:
-        print("추적 중인 이슈가 없습니다. `deputy next` 로 시작하세요.")
-        return
-    order = ["deputy:epic", "deputy:wip", "deputy:next", "deputy:agreed",
-             "deputy:revise", "deputy:blocked"]
-    titles = {"deputy:epic": "에픽", "deputy:wip": "진행 중", "deputy:next": "리뷰 대기",
-              "deputy:agreed": "합의 완료", "deputy:revise": "수정 필요",
-              "deputy:blocked": "막힘 - 사람 필요"}
+
+    tracked = [i for i in list_issues() if label_names(i) & set(LABELS)]
+
+    # 에픽은 합의 집계보다 자식 진행률이 궁금하다
+    epics = [i for i in tracked if "deputy:epic" in label_names(i)]
+    if epics:
+        print(f"[에픽] {len(epics)}건")
+        for i in sorted(epics, key=lambda x: x["number"]):
+            full = issue(i["number"], cached=True, check=False) or i
+            kids = children_of(full)
+            openk = open_children(full)
+            done = len(kids) - len(openk)
+            bar = ("█" * done + "░" * len(openk)) if kids else ""
+            print(f"  #{i['number']:<5} {i['title'][:44]:<46} {done}/{len(kids)} {bar}")
+        print()
+
+    order = ["deputy:wip", "deputy:next", "deputy:agreed", "deputy:revise", "deputy:blocked"]
+    titles = {"deputy:wip": "진행 중", "deputy:next": "리뷰 대기", "deputy:agreed": "착수 대기",
+              "deputy:revise": "수정 필요", "deputy:blocked": "막힘 - 사람 필요"}
     for lb in order:
-        group = [i for i in tracked if lb in label_names(i)]
+        group = [i for i in tracked if lb in label_names(i) and "deputy:epic" not in label_names(i)]
         if not group:
             continue
         print(f"[{titles[lb]}] {len(group)}건")
-        for i in group:
-            full = issue(i["number"])
-            v = consensus(cfg, full)
-            d = v["detail"]
+        for i in sorted(group, key=lambda x: x["number"]):
             who = ""
-            cs = deputy_comments(full)
-            actor = [c for c in cs if c["kind"] in ("claim", "propose")]
-            if actor:
-                who = f"  ← {actor[-1]['by']}"
-            tail = ""
-            if d:
-                tail = (f"  동의{len(d.get('agree',[]))} 반대{len(d.get('object',[]))} "
-                        f"대기{len(d.get('pending',[]))}")
-            print(f"  #{i['number']:<5} {i['title'][:46]:<48}{who}{tail}")
+            if lb in ("deputy:wip", "deputy:next"):
+                full = issue(i["number"], cached=True, check=False)
+                if full:
+                    cs = deputy_comments(full)
+                    actor = [c for c in cs if c["kind"] in ("claim", "propose", "plan")]
+                    if actor:
+                        who = f"  ← {actor[-1]['by']}"
+            print(f"  #{i['number']:<5} {i['title'][:46]:<48}{who}")
         print()
+
+    # 밤새 무엇이 끝났는지가 아침에 가장 궁금한 정보다.
+    # 닫힌 이슈는 라벨이 지워지므로 코멘트의 마커로 찾는다.
+    if not args.no_done:
+        cutoff = time.time() - args.days * 86400
+        closed = gh(["issue", "list", "--state", "closed", "--limit", str(args.limit),
+                     "--json", "number,title,closedAt"], parse=True, check=False) or []
+        # 열린 목록과 닫힌 목록을 따로 받아오는 사이에 세션이 이슈를 닫으면
+        # 같은 이슈가 양쪽에 나온다. 열린 쪽에서 이미 보여준 것은 제외한다.
+        shown = {i["number"] for i in tracked}
+        recent = [c for c in closed
+                  if parse_iso(c["closedAt"]) >= cutoff and c["number"] not in shown]
+        rows = []
+        for c in recent[: args.limit]:
+            full = issue(c["number"], cached=True, check=False)
+            if not full:
+                continue
+            dones = [x for x in deputy_comments(full) if x["kind"] == "done"]
+            if not dones:
+                continue
+            body = MARK.sub("", dones[-1]["body"])
+            body = re.sub(r"^###.*$", "", body, flags=re.M).strip().replace("\n", " ")
+            rows.append((c["number"], c["title"], dones[-1]["by"],
+                         parse_iso(c["closedAt"]), body))
+        if rows:
+            print(f"[최근 {args.days}일 완료] {len(rows)}건")
+            for num, title, by, at, body in sorted(rows, key=lambda r: -r[3]):
+                print(f"  #{num:<5} {title[:44]:<46} ← {by}  {stamp(at)}")
+                if body:
+                    print(f"         {body[:104]}")
+            print()
+
+    if not tracked and not args.no_done:
+        print("추적 중인 이슈가 없습니다. deputy next 로 시작하세요.")
     if args.web:
         gh(["issue", "list", "--web"], check=False)
 
@@ -2374,6 +2414,10 @@ def main_parser():
   deputy status --web    # 브라우저로도 연다
 """)
     s.add_argument("--web", action="store_true", help="브라우저로도 연다")
+    s.add_argument("--days", type=int, default=3, metavar="N",
+                   help="최근 N일 안에 완료된 작업을 함께 보여준다 (기본 3)")
+    s.add_argument("--limit", type=int, default=12, help="완료 목록 최대 건수")
+    s.add_argument("--no-done", action="store_true", help="완료 목록을 생략한다")
     s.set_defaults(fn=cmd_status)
 
     s = add("doctor", "무인 운영 전 점검", """
