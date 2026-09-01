@@ -146,6 +146,22 @@ def repo_root():
     return r.stdout.strip()
 
 
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 def _strip_comments(obj):
     """설정 스니펫의 _주석 키를 제거한다."""
     if isinstance(obj, dict):
@@ -1937,7 +1953,9 @@ def cmd_at(cfg, args):
 def session_states(cfg):
     """
     claude agents 에서 이 프로젝트의 deputy 세션 상태를 읽는다.
-    상태 어휘: busy(일하는 중) / idle(대기) / blocked(입력 대기 또는 리밋) / 없음(죽음)
+
+    같은 이름이 여러 번 나온다. 재기동해도 죽은 기록이 목록에 남기 때문이다.
+    busy > pid 있음 > 최근 시작 순으로 살아 있을 가능성이 높은 것을 고른다.
     """
     out = gh_free(["claude", "agents", "--json"])
     rows = []
@@ -1947,24 +1965,25 @@ def session_states(cfg):
             rows = d if isinstance(d, list) else d.get("agents", d.get("sessions", []))
         except Exception:
             rows = []
-    # 같은 이름이 여러 번 나올 수 있다. 재기동해도 죽은 항목이 목록에 남기 때문이다.
-    # 살아 있는 것(pid 가 있는 것)을 우선한다. 그러지 않으면 멀쩡히 도는 세션을
-    # 죽었다고 판단해 계속 재기동하는 무한 루프에 빠진다.
+
+    def rank(a):
+        st = a.get("status") or a.get("state")
+        return (st == "busy", a.get("pid") is not None, a.get("startedAt") or 0)
+
     by_name = {}
     for a in rows:
         n = str(a.get("name") or "")
         if not n.startswith("deputy-"):
             continue
         m = n[len("deputy-"):]
-        cur = {
-            "status": a.get("status") or a.get("state"),
-            "id": a.get("sessionId") or a.get("id"),
-            "pid": a.get("pid"),
-        }
-        prev = by_name.get(m)
-        if prev is None or (prev.get("pid") is None and cur.get("pid") is not None):
-            by_name[m] = cur
-        by_name.setdefault(m, cur)
+        if m not in by_name or rank(a) > rank(by_name[m]["_raw"]):
+            by_name[m] = {
+                "status": a.get("status") or a.get("state"),
+                "id": a.get("sessionId") or a.get("id"),
+                "pid": a.get("pid"),
+                "startedAt": a.get("startedAt") or 0,
+                "_raw": a,
+            }
     return {m: by_name.get(m) for m in members(cfg)}
 
 
@@ -1977,59 +1996,86 @@ def gh_free(argv, timeout=30):
         return None
 
 
+def watch_state_path():
+    d = os.path.join(HOME, ".deputy")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "watch-state.json")
+
+
 def cmd_watch(cfg, args):
     """
     죽었거나 멈춘 세션을 되살린다.
 
-    이게 필요한 이유: 백그라운드 세션은 사용량 리밋에 걸리면 그냥 죽는다.
-    autoContinueAtUsageLimit 은 열려 있는 대화형 세션에만 적용되고,
-    문서상 백그라운드 세션과 -p 실행에는 대기 옵션 자체가 제공되지 않는다.
-    그래서 리밋에 걸린 무인 세션은 리셋이 와도 스스로 돌아오지 못한다.
+    무인 deputy 세션에게 정상인 상태는 busy 하나뿐이다.
+    idle 은 '대기 중' 이 아니라 '목표 루프가 끊겨서 영영 안 올 프롬프트를 기다리는 중'
+    이다. 리밋에 걸린 세션도 잠시 뒤 idle 로 보고되므로, idle 을 정상으로 보면
+    감시자가 아무 일도 하지 않는다. 실제로 그렇게 6시간 반을 날린 적이 있다.
 
-    되살리는 방식은 '복구'가 아니라 '새로 띄우기'다. 상태가 전부 GitHub 이슈에
-    있으므로 새 세션이 deputy next 로 곧바로 이어받는다. 40시간 묵은 컨텍스트를
-    되살리는 것보다 깨끗하다.
+    되살리기는 복구가 아니라 새로 띄우기다. 상태가 전부 GitHub 이슈에 있으므로
+    새 세션이 deputy next 로 곧바로 이어받는다.
+
+    쿨다운을 두는 이유: 리밋이 아직 안 풀렸는데 10분마다 되살리면 세션이 뜨자마자
+    다시 죽으면서 토큰만 태운다. 멤버당 최소 간격을 둔다.
     """
     root = repo_root()
     up = os.path.join(PKG_DIR, "bin", "deputy-up.sh")
     if not os.path.exists(up):
         die(f"{up} 을 찾을 수 없습니다.")
 
+    st_path = watch_state_path()
+    hist = read_json(st_path, {}) or {}
+    key = root
+    last = hist.get(key, {})
+
     states = session_states(cfg)
-    revive_states = {"blocked", "failed", "stopped", "exited"}
-    acted = []
+    now = time.time()
+    acted, skipped = [], []
 
     print(f"=== deputy watch :: {os.path.basename(root)} ===  {stamp()}")
     for m, st in states.items():
-        if st is None:
-            reason = "세션 없음"
-        elif st["status"] in revive_states:
-            reason = f"상태 {st['status']}"
-        elif st["status"] is None:
-            reason = "상태 없음(종료된 기록)"
-        elif st["pid"] is None:
-            reason = "프로세스 죽음"
-        else:
-            print(f"  ok    {m:<10} {st['status']}")
+        if st and st.get("status") == "busy":
+            print(f"  ok      {m:<10} busy")
             continue
 
-        print(f"  살림  {m:<10} {reason}")
+        # 방금 띄운 세션이 아직 busy 로 바뀌지 않았을 수 있다
+        started = (st or {}).get("startedAt") or 0
+        if started and (now - started / 1000.0) < args.grace:
+            print(f"  대기중  {m:<10} 기동 {int(now - started/1000.0)}초 경과 (유예 {args.grace}초)")
+            continue
+
+        why = "세션 없음" if st is None else f"상태 {st.get('status')!r}"
+
+        prev = last.get(m, 0)
+        if now - prev < args.cooldown:
+            wait = int((args.cooldown - (now - prev)) / 60)
+            print(f"  쿨다운  {m:<10} {why} — {wait}분 뒤 재시도")
+            skipped.append(m)
+            continue
+
+        print(f"  살림    {m:<10} {why}")
         acted.append(m)
         if args.dry:
             continue
+
         if st and st.get("id"):
             gh_free(["claude", "stop", st["id"]], timeout=20)
             gh_free(["claude", "rm", st["id"]], timeout=20)
         r = subprocess.run(["bash", up, "--only", m], cwd=root,
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
-            print(f"        기동 실패: {(r.stderr or r.stdout).strip()[:160]}")
+            print(f"          기동 실패: {(r.stderr or r.stdout).strip()[:160]}")
+        else:
+            last[m] = now
 
-    if not acted:
+    if not args.dry:
+        hist[key] = last
+        write_json(st_path, hist)
+
+    if not acted and not skipped:
         print("  전부 정상입니다.")
     elif args.dry:
         print(f"\n  [--dry] {len(acted)}개를 되살릴 예정이었습니다.")
-    else:
+    elif acted:
         print(f"\n  {len(acted)}개 재기동했습니다.")
 
     if args.loop:
@@ -2037,7 +2083,7 @@ def cmd_watch(cfg, args):
         while True:
             time.sleep(args.loop)
             try:
-                cmd_watch(cfg, argparse.Namespace(as_=args.as_, loop=0, dry=args.dry, cmd="watch"))
+                cmd_watch(cfg, argparse.Namespace(**{**vars(args), "loop": 0}))
             except SystemExit:
                 pass
             except Exception as e:
@@ -2407,6 +2453,11 @@ def main_parser():
     s.add_argument("--dry", action="store_true", help="재기동하지 않고 판단만 출력")
     s.add_argument("--loop", type=int, default=0, metavar="SEC",
                    help="지정한 초 간격으로 반복 점검한다")
+    s.add_argument("--cooldown", type=int, default=900, metavar="SEC",
+                   help="같은 멤버를 다시 띄우기까지의 최소 간격 (기본 900초). "
+                        "리밋이 안 풀렸을 때 반복 재기동으로 토큰을 태우지 않게 한다")
+    s.add_argument("--grace", type=int, default=180, metavar="SEC",
+                   help="기동 직후 busy 가 아니어도 봐주는 시간 (기본 180초)")
     s.set_defaults(fn=cmd_watch)
 
     s = add("status", "전체 현황", """
