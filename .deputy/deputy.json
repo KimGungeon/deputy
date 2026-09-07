@@ -1,0 +1,28 @@
+{
+  "review_timeout_minutes": 45,
+  "max_revisions": 2,
+  "members": [
+    {
+      "name": "lead",
+      "role": "coordinator",
+      "owns": [],
+      "brief": "담당 디렉터리 없음. 전체 우선순위 조율, 제안 교차 검증, 충돌·정체 중재, 무주지 판단"
+    },
+    {
+      "name": "bin",
+      "owns": [
+        "bin"
+      ],
+      "brief": "Python · 셸, 파일 2개",
+      "role": "builder"
+    },
+    {
+      "name": "settings",
+      "owns": [
+        "settings"
+      ],
+      "brief": "설정, 파일 2개",
+      "role": "builder"
+    }
+  ]
+}
