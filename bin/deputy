@@ -2000,9 +2000,18 @@ def session_states(cfg):
 
 
 def gh_free(argv, timeout=30):
-    """gh 가 아닌 임의 명령 실행. 실패해도 죽지 않는다."""
+    """
+    gh 가 아닌 임의 명령 실행. 실패해도 죽지 않는다.
+
+    Windows 는 CreateProcess 가 확장자 없는 이름에 .exe 만 자동으로 붙이고
+    .cmd/.bat 는 안 붙인다. claude 가 npm 전역 설치로 claude.CMD 인 환경에서는
+    subprocess.run(["claude", ...]) 이 FileNotFoundError 로 조용히 실패해
+    session_states() 가 모든 세션을 "없음"으로 오판하고 무조건 재기동을
+    시도하는 위험한 상태가 된다. shutil.which 로 실제 실행 파일을 미리 찾는다.
+    """
     try:
-        r = subprocess.run(argv, capture_output=True, text=True,
+        exe = shutil.which(argv[0]) or argv[0]
+        r = subprocess.run([exe] + list(argv[1:]), capture_output=True, text=True,
                            encoding="utf-8", timeout=timeout)
         return r.stdout if r.returncode == 0 else None
     except Exception:
