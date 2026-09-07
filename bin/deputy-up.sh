@@ -5,6 +5,12 @@
 # 하는 일: 점검 → 절전 차단 → 멤버별 백그라운드 세션 기동(목표 부착)
 set -euo pipefail
 
+# Windows(cp949 등) 로케일에서 python3 -c 의 stdout 이 파이프로 캡처될 때
+# UTF-8 이 아니라 로케일 코드페이지로 인코딩되어, 한글 brief/owns 가 깨진
+# 바이트로 $PROMPT 에 섞여 들어간다. 이 깨진 텍스트가 claude --bg 의 인자로
+# 넘어가면 조용히 멈춰버린다(재현: bash -x 로 확인, 180초 타임아웃 후 죽음).
+export PYTHONIOENCODING=utf-8
+
 ONLY=""
 PROJECT="$PWD"
 while [ $# -gt 0 ]; do

@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -2084,6 +2085,15 @@ def cmd_watch(cfg, args):
     up = os.path.join(PKG_DIR, "bin", "deputy-up.sh")
     if not os.path.exists(up):
         die(f"{up} 을 찾을 수 없습니다.")
+    # Windows: bash(MSYS)에 인자로 넘기는 경로는 백슬래시를 자기 이스케이프
+    # 문자로 먹어버려 "C:\...\deputy-up.sh" 가 "C:...deputy-up.sh" 로 깨진다.
+    up_for_bash = up.replace(os.sep, "/") if sys.platform == "win32" else up
+    # "bash" 를 이름만으로 실행하면, WSL 이 설치된 Windows 에서는 CreateProcess 가
+    # PATH 대신 레지스트리 App Paths 를 먼저 봐서 Git bash 가 아니라 System32 의
+    # WSL bash 로 뒤바뀐다. WSL bash 는 파일시스템 루트가 아예 달라(/mnt/c/...)
+    # 위에서 만든 Git-bash 스타일 경로를 못 찾는다. shutil.which 로 실제 PATH 순서
+    # 그대로의 bash 를 못박아 이 뒤바뀜을 피한다.
+    bash_exe = shutil.which("bash") or "bash"
 
     st_path = watch_state_path()
     hist = read_json(st_path, {}) or {}
@@ -2132,12 +2142,24 @@ def cmd_watch(cfg, args):
         if st and st.get("id"):
             gh_free(["claude", "stop", st["id"]], timeout=20)
             gh_free(["claude", "rm", st["id"]], timeout=20)
-        r = subprocess.run(["bash", up, "--only", m], cwd=root,
-                           capture_output=True, text=True, encoding="utf-8", timeout=180)
-        if r.returncode != 0:
-            print(f"          기동 실패: {(r.stderr or r.stdout).strip()[:160]}")
-        else:
-            last[m] = now
+        # capture_output=True(파이프)를 쓰면 deputy-up.sh 가 띄우는 claude --bg 의
+        # 백그라운드 데몬이 그 파이프의 쓰기 쪽 핸들을 물려받아 계속 열어두고 있어서,
+        # bash 스크립트 자신은 진작 끝났는데도 communicate() 가 파이프 EOF 를 못 보고
+        # 타임아웃까지 그대로 멈춘다(직접 재현: 실제로 180초 내내 멈췄다가 죽음).
+        # 파이프 대신 임시 파일로 받으면 wait() 이 프로세스 종료만 보고 끝나 이 문제가 없다.
+        try:
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as outf:
+                r = subprocess.run([bash_exe, up_for_bash, "--only", m], cwd=root,
+                                   stdout=outf, stderr=subprocess.STDOUT, timeout=180)
+                if r.returncode != 0:
+                    outf.seek(0)
+                    print(f"          기동 실패: {outf.read().strip()[-160:]}")
+                else:
+                    last[m] = now
+        except subprocess.TimeoutExpired:
+            print(f"          기동 실패: 180초 안에 끝나지 않았습니다. 다음 점검에서 재시도합니다.")
+        except Exception as e:
+            print(f"          기동 실패: {e}")
 
     if not args.dry:
         hist[key] = last
