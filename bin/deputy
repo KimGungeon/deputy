@@ -19,6 +19,7 @@ deputy - 여러 Claude Code 세션이 사람 없이 토론하고 합의하며 �
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -376,6 +377,27 @@ def human_comments_since(iss, ts):
         if parse_iso(c["createdAt"]) > ts:
             out.append(c)
     return out
+
+
+def human_comment_ref(comment):
+    """Bind acknowledgement to one comment version, including edited text."""
+    payload = json.dumps([comment.get("id"), comment.get("createdAt"),
+                          comment.get("body")], ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def pending_human_comments(iss, me):
+    acknowledged = set()
+    for c in deputy_comments(iss):
+        if c["kind"] == "ack" and c["by"] == me:
+            acknowledged.update(re.findall(r"<!-- deputy-ack ref=([a-f0-9]{64}) -->", c["body"]))
+    return [c for c in human_comments_since(iss, 0)
+            if human_comment_ref(c) not in acknowledged]
+
+
+def claim_owner(iss):
+    """The earliest claim wins; later losing claims do not transfer ownership."""
+    return next((c["by"] for c in deputy_comments(iss) if c["kind"] == "claim"), None)
 
 
 # ---------------------------------------------------------------- 합의 판정
@@ -1379,14 +1401,11 @@ def cmd_done(cfg, args):
     me = whoami(cfg, args.as_)
     iss = issue(args.number)
 
-    gh(["issue", "comment", str(args.number), "--body",
-        f"<!-- deputy v1 kind=done by={me} -->\n### ✅ `{me}` 완료\n\n{args.result}\n"])
-
     kids = open_children(iss)
     closed = False
     if args.close:
         if kids:
-            print(f"완료 기록: #{args.number} — 그러나 이슈를 닫지 않았습니다.")
+            print(f"완료 보류: #{args.number} — 이슈를 닫지 않았습니다.")
             print(f"\n열린 파생 이슈가 {len(kids)}건 있습니다: "
                   + ", ".join(f"#{k}" for k in kids))
             print("부모는 파생이 모두 닫힌 뒤에 닫힙니다.")
@@ -1395,8 +1414,15 @@ def cmd_done(cfg, args):
             # 라벨과 배정을 그대로 둔다. 부모는 포기된 게 아니라 자식을 기다리는
             # 진행 중 상태다. 여기서 라벨을 떼면 어느 목록에도 안 나오는 미아가 된다.
             sys.exit(3)
-        gh(["issue", "close", str(args.number)], check=False)
+        if gh(["issue", "close", str(args.number)], check=False) is None:
+            die("이슈 닫기에 실패했습니다. 진행 라벨과 담당을 유지합니다. 다시 시도하세요.")
+        verified = issue(args.number, check=False)
+        if not verified or verified.get("state") != "CLOSED":
+            die("이슈가 닫혔는지 확인하지 못했습니다. 진행 라벨과 담당을 유지합니다.")
         closed = True
+
+    gh(["issue", "comment", str(args.number), "--body",
+        f"<!-- deputy v1 kind=done by={me} -->\n### ✅ `{me}` 완료\n\n{args.result}\n"])
 
     set_labels(args.number, remove=["deputy:wip", "deputy:next", "deputy:agreed"], verify=False)
     gh(["issue", "edit", str(args.number), "--remove-assignee", "@me"], check=False)
@@ -1519,7 +1545,7 @@ def next_for_coordinator(cfg, me, full, active, out):
             out.append("  진행 중:")
             for d in wip:
                 cs = deputy_comments(d)
-                who = next((c["by"] for c in reversed(cs) if c["kind"] == "claim"), "?")
+                who = claim_owner(d) or "?"
                 last = max((c["at"] for c in cs), default=0)
                 idle = (time.time() - last) / 3600 if last else 0
                 flag = f"  [{idle:.1f}시간째 무소식]" if idle > 2 else ""
@@ -1578,34 +1604,31 @@ def cmd_next(cfg, args):
     print()
 
     active = active_issues()
-    tracked = [i for i in active if label_names(i) & set(LABELS)]
-
     full, skipped = {}, []
-    for i in tracked:
+    for i in active:
         d = issue(i["number"], cached=True, check=False)
         if d is None:
             skipped.append(i["number"])
         else:
             full[i["number"]] = d
 
+    # A normal note/review is not an acknowledgement of a human instruction.
+    # Read unlabelled issues too, and stop before proposing conflicting work.
     out = []
+    human = [(d, c) for d in full.values() for c in pending_human_comments(d, me)]
+    if human:
+        out.append("[0순위] 미확인 사람 코멘트가 있습니다. 먼저 반영하세요.")
+        for d, c in human:
+            ref = human_comment_ref(c)
+            out.append(f"  · #{d['number']} {d['title']}\n    {c['body'].strip()}")
+            out.append(f'    → 반영 후: deputy ack {d["number"]} --comment {ref} --result "반영한 내용"')
+        if skipped:
+            out.append("조회 실패: " + ", ".join(f"#{n}" for n in skipped))
+        print("\n".join(out))
+        return
     if role_of(cfg, me) == COORDINATOR:
         if skipped:
             out.append(f"[안내] 조회 실패로 건너뛴 이슈: " + ", ".join(f"#{n}" for n in skipped))
-            out.append("")
-        # 0순위(사람 코멘트)는 역할과 무관하게 먼저 본다
-        human = []
-        for num, d in full.items():
-            cs = deputy_comments(d)
-            last_bot = cs[-1]["at"] if cs else 0
-            for c in human_comments_since(d, last_bot):
-                human.append((d, c))
-        if human:
-            out.append("[0순위] 사람이 코멘트를 남겼습니다. 다른 무엇보다 먼저 반영하세요.")
-            for d, c in human:
-                out.append(f"  · #{d['number']} {d['title']}")
-                out.append(f"    \"{c['body'].strip()[:260]}\"")
-            out.append("    → 지시대로 조율하고, 이슈에 어떻게 반영했는지 코멘트로 답하세요.")
             out.append("")
         next_for_coordinator(cfg, me, full, active, out)
         print("\n".join(out))
@@ -1616,22 +1639,7 @@ def cmd_next(cfg, args):
                    + ", ".join(f"#{n}" for n in skipped))
         out.append("")
 
-    # 0순위: 사람의 코멘트. 무인 운영 중 유일한 외부 신호다.
-    human = []
-    for num, d in full.items():
-        cs = deputy_comments(d)
-        last_bot = cs[-1]["at"] if cs else 0
-        for c in human_comments_since(d, last_bot):
-            human.append((d, c))
-    if human:
-        out.append("[0순위] 사람이 코멘트를 남겼습니다. 다른 무엇보다 먼저 반영하세요.")
-        for d, c in human:
-            out.append(f"  · #{d['number']} {d['title']}")
-            out.append(f"    \"{c['body'].strip()[:260]}\"")
-        out.append("    → 지시대로 계획을 고치고, 어떻게 반영했는지 이슈에 코멘트로 답하세요.")
-        out.append("")
-
-    # 1순위: 내 리뷰를 기다리며 남이 막혀 있는 것
+    # 1순위: 내 리뷰를 기다리는 제안.
     owed = []
     for num, d in full.items():
         if "deputy:next" not in label_names(d):
@@ -1659,11 +1667,11 @@ def cmd_next(cfg, args):
     for num, d in full.items():
         if "deputy:wip" not in label_names(d):
             continue
-        claims = [c for c in deputy_comments(d) if c["kind"] == "claim"]
+        owner = claim_owner(d)
         derived = is_derived(d)
         # 파생 이슈는 착수 코멘트 없이 바로 생성되므로 kind=derive 마커로도 소유를 판단한다
         dm = DERIVE_MARK.search(d.get("body") or "")
-        mine = (claims and claims[-1]["by"] == me) or (derived and dm and f"by={me} " in dm.group(0))
+        mine = owner == me if owner else (derived and dm and f"by={me} " in dm.group(0))
         if mine:
             mine_wip.append((d, derived))
     if mine_wip:
@@ -1857,17 +1865,23 @@ def decide_action(cfg, me, iss):
         L.append(f"분해안 검토 대기 중입니다. {v['reason']}")
         return "plan-wait", L, None
 
-    # 계획으로 배정된 자식
+    # 기존 착수자가 있으면 제안/계획 종류와 무관하게 같은 승자를 따른다.
+    if claims:
+        owner = claims[0]["by"]
+        if owner != me:
+            L.append(f"{owner} 가 {stamp(claims[0]['at'])} 에 착수해 진행 중입니다.")
+            L.append("  건드리지 마세요. deputy next 로 내 할 일을 받으세요.")
+            return "other-wip", L, None
+        L.append("내가 착수한 작업입니다.")
+        L.append(f'  끝나면: deputy done {num} --close --result "무엇을 했고 어떻게 검증했는지"')
+        L.append(f'  문제 발견: deputy derive {num} --why "..." --blocks "..." --done-when "..."')
+        return "mine-wip", L, None
+
+    # 계획으로 배정됐지만 아직 착수하지 않은 자식
     if meta:
         if meta["owner"] != me:
             L.append(f"이 작업은 {meta['owner']} 에게 배정됐습니다 (에픽 #{meta['parent']}).")
             return "not-mine", L, None
-        if claims:
-            L.append(f"이미 착수했습니다. 끝나면:")
-            L.append(f'  deputy done {num} --close --result "무엇을 했고 어떻게 검증했는지"')
-            L.append(f'  작업 중 부모의 완료 기준을 위협하는 문제를 발견하면:')
-            L.append(f'  deputy derive {num} --why "..." --blocks "..." --done-when "..."')
-            return "mine-wip", L, None
         L.append(f"계획으로 내게 배정된 작업입니다 (에픽 #{meta['parent']}). 재합의 불필요.")
         return "planned-claim", L, ["claim", str(num)]
 
@@ -1889,17 +1903,6 @@ def decide_action(cfg, me, iss):
 
     p = props[-1]
     v = consensus(cfg, iss)
-
-    if claims:
-        owner = claims[0]["by"]
-        if owner != me:
-            L.append(f"{owner} 가 {stamp(claims[0]['at'])} 에 착수해 진행 중입니다.")
-            L.append("  건드리지 마세요. deputy next 로 내 할 일을 받으세요.")
-            return "other-wip", L, None
-        L.append("내가 착수한 작업입니다.")
-        L.append(f'  끝나면: deputy done {num} --close --result "무엇을 했고 어떻게 검증했는지"')
-        L.append(f'  문제 발견: deputy derive {num} --why "..." --blocks "..." --done-when "..."')
-        return "mine-wip", L, None
 
     if p["by"] != me:
         done = any(c["kind"] == "review" and c["by"] == me and c["rev"] == p["rev"] for c in cs)
@@ -1970,14 +1973,15 @@ def session_states(cfg):
     같은 이름이 여러 번 나온다. 재기동해도 죽은 기록이 목록에 남기 때문이다.
     busy > pid 있음 > 최근 시작 순으로 살아 있을 가능성이 높은 것을 고른다.
     """
-    out = gh_free(["claude", "agents", "--json"])
-    rows = []
-    if out:
-        try:
-            d = json.loads(out)
-            rows = d if isinstance(d, list) else d.get("agents", d.get("sessions", []))
-        except Exception:
-            rows = []
+    root = repo_root()
+    out = gh_free(["claude", "agents", "--json", "--cwd", root])
+    try:
+        data = json.loads(out)
+        rows = data if isinstance(data, list) else data.get("agents", data.get("sessions"))
+        if not isinstance(rows, list) or any(not isinstance(a, dict) for a in rows):
+            raise ValueError("invalid session list")
+    except (TypeError, ValueError, AttributeError):
+        die("세션 목록 조회에 실패했습니다. 기존 세션 보호를 위해 재기동하지 않습니다.")
 
     def rank(a):
         st = a.get("status") or a.get("state")
@@ -1985,6 +1989,8 @@ def session_states(cfg):
 
     by_name = {}
     for a in rows:
+        if not same_project(a.get("cwd"), root):
+            continue
         n = str(a.get("name") or "")
         if not n.startswith("deputy-"):
             continue
@@ -2022,6 +2028,13 @@ def gh_free(argv, timeout=30):
 AUTH_HINTS = ("login required", "not logged in", "please run /login", "authentication")
 
 
+def same_project(cwd, root):
+    """Reject missing/relative paths and sibling repositories before ranking."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return False
+    return os.path.normcase(os.path.realpath(cwd)) == os.path.normcase(os.path.realpath(root))
+
+
 def job_details():
     """
     슈퍼바이저가 남긴 잡 상태 파일에서 세션별 사유를 읽는다.
@@ -2029,12 +2042,13 @@ def job_details():
     리밋과 인증 만료가 둘 다 blocked 로 보이므로 이 파일을 봐야 구분된다.
     """
     out = {}
+    root = repo_root()
     base = os.path.join(HOME, ".claude", "jobs")
     if not os.path.isdir(base):
         return out
     for jid in os.listdir(base):
         d = read_json(os.path.join(base, jid, "state.json"))
-        if not d:
+        if not isinstance(d, dict) or not same_project(d.get("cwd"), root):
             continue
         n = str(d.get("name") or "")
         if not n.startswith("deputy-"):
@@ -2121,7 +2135,7 @@ def cmd_watch(cfg, args):
     states = session_states(cfg)
     jobs = job_details()
     now = time.time()
-    acted, skipped, auth_blocked = [], [], []
+    acted, skipped, auth_blocked, succeeded, failed = [], [], [], [], []
 
     print(f"=== deputy watch :: {os.path.basename(root)} ===  {stamp()}")
     for m, st in states.items():
@@ -2172,19 +2186,25 @@ def cmd_watch(cfg, args):
                 r = subprocess.run([bash_exe, up_for_bash, "--only", m], cwd=root,
                                    stdout=outf, stderr=subprocess.STDOUT, timeout=180)
                 if r.returncode != 0:
+                    failed.append(m)
                     outf.seek(0)
                     print(f"          기동 실패: {outf.read().strip()[-160:]}")
                 else:
                     last[m] = now
+                    succeeded.append(m)
         except subprocess.TimeoutExpired:
+            failed.append(m)
             print(f"          기동 실패: 180초 안에 끝나지 않았습니다. 다음 점검에서 재시도합니다.")
         except Exception as e:
+            failed.append(m)
             print(f"          기동 실패: {e}")
 
     if not args.dry:
         hist[key] = last
         write_json(st_path, hist)
 
+    if failed:
+        print(f"\n  재기동 실패: {', '.join(failed)}")
     if auth_blocked:
         print(f"\n  [사람이 필요합니다] {', '.join(auth_blocked)} 가 인증에서 막혔습니다.")
         print("  Claude Code 프롬프트에 /login 을 입력해 다시 로그인한 뒤")
@@ -2196,7 +2216,7 @@ def cmd_watch(cfg, args):
     elif args.dry:
         print(f"\n  [--dry] {len(acted)}개를 되살릴 예정이었습니다.")
     elif acted:
-        print(f"\n  {len(acted)}개 재기동했습니다.")
+        print(f"\n  {len(succeeded)}개 재기동했습니다. 실패 {len(failed)}개.")
 
     if args.loop:
         print(f"\n  {args.loop}초 뒤 다시 점검합니다. Ctrl+C 로 중단.")
@@ -2244,7 +2264,8 @@ def cmd_status(cfg, args):
                     cs = deputy_comments(full)
                     actor = [c for c in cs if c["kind"] in ("claim", "propose", "plan")]
                     if actor:
-                        who = f"  ← {actor[-1]['by']}"
+                        owner = claim_owner(full) if lb == "deputy:wip" else actor[-1]["by"]
+                        who = f"  ← {owner or '?'}"
             print(f"  #{i['number']:<5} {i['title'][:46]:<48}{who}")
         print()
 
@@ -2283,6 +2304,22 @@ def cmd_status(cfg, args):
         print("추적 중인 이슈가 없습니다. deputy next 로 시작하세요.")
     if args.web:
         gh(["issue", "list", "--web"], check=False)
+
+
+def cmd_ack(cfg, args):
+    me = whoami(cfg, args.as_)
+    iss = issue(args.number)
+    target = next((c for c in human_comments_since(iss, 0)
+                   if args.comment in (c.get("id"), human_comment_ref(c))), None)
+    if target is None:
+        die("지정한 사람 코멘트를 찾지 못했습니다. deputy next 로 확인하세요.")
+    if not args.result.strip():
+        die("사람의 지시를 어떻게 반영했는지 --result 에 기록하세요.")
+    gh(["issue", "comment", str(args.number), "--body",
+        f"<!-- deputy v1 kind=ack by={me} -->\n"
+        f"<!-- deputy-ack ref={human_comment_ref(target)} -->\n"
+        f"### `{me}` 사람 코멘트 반영\n\n{args.result}"])
+    print(f"확인 기록: #{args.number} ({args.comment})")
 
 
 def cmd_note(cfg, args):
@@ -2557,6 +2594,14 @@ def main_parser():
     s.add_argument("--no-next", action="store_true",
                    help="완료 후 다음 할 일을 이어서 보여주지 않는다")
     s.set_defaults(fn=cmd_done)
+
+    s = add("ack", "사람 코멘트를 반영했음을 세션별로 기록한다", """
+  deputy ack 12 --comment IC_example --result "요청대로 작업을 중단했습니다"
+""")
+    s.add_argument("number", type=int)
+    s.add_argument("--comment", required=True, help="next 에 표시된 코멘트 버전 또는 ID")
+    s.add_argument("--result", required=True, help="지시를 어떻게 반영했는지")
+    s.set_defaults(fn=cmd_ack)
 
     s = add("note", "이슈에 메모를 남긴다", """
   deputy note 12 "리팩터링 중 발견: 이 경로는 캐시를 두 번 탄다. 별도 이슈 필요."
