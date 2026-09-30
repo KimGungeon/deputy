@@ -1,0 +1,14 @@
+[
+  {"id":"A1","owner":"alpha","title":"Normalize names and reject empty values","after":[],"check":"test_a1"},
+  {"id":"A2","owner":"alpha","title":"Parse nonnegative ASCII integer counts","after":[],"check":"test_a2"},
+  {"id":"A3","owner":"alpha","title":"Parse CSV into the shared name/count schema","after":["A1","A2"],"check":"test_a3"},
+  {"id":"A4","owner":"alpha","title":"Combine duplicates without mutating inputs","after":["A1","A2"],"check":"test_a4"},
+  {"id":"B1","owner":"beta","title":"Summarize counts including empty input","after":[],"check":"test_b1"},
+  {"id":"B2","owner":"beta","title":"Rank names with deterministic tie breaking","after":[],"check":"test_b2"},
+  {"id":"B3","owner":"beta","title":"Render deterministic Unicode JSON","after":["B1"],"check":"test_b3"},
+  {"id":"B4","owner":"beta","title":"Connect CSV normalization and summary output","after":["A3","A4","B1","B3"],"check":"test_b4"},
+  {"id":"I1","owner":"alpha","title":"Verify quoted CSV and duplicate-name behavior","after":["A3","A4"],"check":"test_i1"},
+  {"id":"I2","owner":"alpha","title":"Verify malformed CSV cannot silently lose fields","after":["A3"],"check":"test_i2"},
+  {"id":"I3","owner":"beta","title":"Verify empty pipeline output against the contract","after":["B4"],"check":"test_i3"},
+  {"id":"I4","owner":"beta","title":"Verify end-to-end Unicode and repeated names","after":["B4"],"check":"test_i4"}
+]

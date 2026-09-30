@@ -1,0 +1,8 @@
+[
+  {"id":"S1","name":"human_instruction","expected":"Ordinary notes do not acknowledge instructions; edited instructions reappear."},
+  {"id":"S2","name":"claim_race","expected":"The earliest claimant remains owner after the loser withdraws."},
+  {"id":"S3","name":"launch_failure","expected":"A failed launch is not counted as a successful restart."},
+  {"id":"S4","name":"project_isolation","expected":"Foreign cwd sessions are never selected or stopped."},
+  {"id":"S5","name":"close_failure","expected":"Failed close preserves labels and assignees until a verified retry."},
+  {"id":"S6","name":"query_failure_and_completion","expected":"Failed discovery causes no restarts; completed backlog stops without revival."}
+]
