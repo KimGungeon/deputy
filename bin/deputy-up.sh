@@ -5,6 +5,12 @@
 # 하는 일: 점검 → 절전 차단 → 멤버별 백그라운드 세션 기동(목표 부착)
 set -euo pipefail
 
+# Windows(cp949 등) 로케일에서 python3 -c 의 stdout 이 파이프로 캡처될 때
+# UTF-8 이 아니라 로케일 코드페이지로 인코딩되어, 한글 brief/owns 가 깨진
+# 바이트로 $PROMPT 에 섞여 들어간다. 이 깨진 텍스트가 claude --bg 의 인자로
+# 넘어가면 조용히 멈춰버린다(재현: bash -x 로 확인, 180초 타임아웃 후 죽음).
+export PYTHONIOENCODING=utf-8
+
 ONLY=""
 PROJECT="$PWD"
 while [ $# -gt 0 ]; do
@@ -55,20 +61,20 @@ fi
 fi
 
 [ -z "${QUIET:-}" ] && { echo; echo "=== 3/4 세션 기동 ==="; }
-MEMBERS="${MEMBERS_OVERRIDE:-$(python3 -c "import json;print(' '.join(m['name'] for m in json.load(open('$CFG'))['members']))")}"
+MEMBERS="${MEMBERS_OVERRIDE:-$(python3 -c "import json;print(' '.join(m['name'] for m in json.load(open('$CFG', encoding='utf-8'))['members']))")}"
 
 for M in $MEMBERS; do
   BRIEF=$(python3 -c "
 import json
-m=[x for x in json.load(open('$CFG'))['members'] if x['name']=='$M'][0]
+m=[x for x in json.load(open('$CFG', encoding='utf-8'))['members'] if x['name']=='$M'][0]
 print(m.get('brief','') or '(역할 미지정)')")
   OWNS=$(python3 -c "
 import json
-m=[x for x in json.load(open('$CFG'))['members'] if x['name']=='$M'][0]
+m=[x for x in json.load(open('$CFG', encoding='utf-8'))['members'] if x['name']=='$M'][0]
 print(', '.join(m.get('owns',[])) or '(담당 미지정)')")
   ROLE=$(python3 -c "
 import json
-m=[x for x in json.load(open('$CFG'))['members'] if x['name']=='$M'][0]
+m=[x for x in json.load(open('$CFG', encoding='utf-8'))['members'] if x['name']=='$M'][0]
 print(m.get('role','builder'))")
 
   if [ "$ROLE" = "coordinator" ]; then
