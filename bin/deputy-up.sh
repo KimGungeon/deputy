@@ -63,6 +63,7 @@ fi
 [ -z "${QUIET:-}" ] && { echo; echo "=== 3/4 세션 기동 ==="; }
 MEMBERS="${MEMBERS_OVERRIDE:-$(python3 -c "import json;print(' '.join(m['name'] for m in json.load(open('$CFG', encoding='utf-8'))['members']))")}"
 
+FAILED=0
 for M in $MEMBERS; do
   BRIEF=$(python3 -c "
 import json
@@ -156,11 +157,16 @@ $GOAL"
 
   echo "  → $M ($ROLE) 기동 중..."
   DEPUTY_MEMBER="$M" claude --bg --name "deputy-$M" "$PROMPT" >/dev/null 2>&1 || {
+    FAILED=1
     echo "     실패. 수동으로 실행하세요:"
     echo "     DEPUTY_MEMBER=$M claude --bg --name deputy-$M \"...\""
   }
 done
 
+if [ "$FAILED" -ne 0 ]; then
+  echo "일부 세션 기동에 실패했습니다. 성공한 세션은 계속 실행됩니다."
+  exit 1
+fi
 if [ -n "${QUIET:-}" ]; then exit 0; fi
 echo
 echo "=== 4/4 완료 ==="

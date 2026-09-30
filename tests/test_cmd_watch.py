@@ -81,6 +81,7 @@ class TestCmdWatch(unittest.TestCase):
                 self.assertEqual(mocks["write_json"].call_args.args[1],
                                  {"other-repo": {"untouched": 42}, "test-repo": {"b": NOW}})
                 self.assertIn("기동 실패", output)
+                self.assertIn("1개 재기동했습니다. 실패 1개", output)
                 self.assertEqual(mocks["gh_free"].call_args_list,
                                  [mock.call(["claude", "stop", "session-a"], timeout=20),
                                   mock.call(["claude", "rm", "session-a"], timeout=20)])
