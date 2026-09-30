@@ -1,4 +1,4 @@
-"""Usage: python -m validation.runner prepare|rehearse|check|seed|preflight."""
+"""Usage: python -m validation.runner prepare|rehearse|check|seed|preflight|live-*."""
 import argparse
 from pathlib import Path
 import re
@@ -8,6 +8,7 @@ import sys
 import json
 
 from .rehearsal import rehearse, load_deputy
+from .live import launch, observe, stop
 from .workspace import prepare, load_run, read, write, check
 from .control import Limits
 
@@ -124,6 +125,14 @@ def main(argv=None):
     p.add_argument("--publish",action="store_true",help="Explicitly write to the named private GitHub test repository")
     p = sub.add_parser("preflight")
     p.add_argument("--run",type=Path,required=True)
+    p = sub.add_parser("live-launch", help="Launch a prepared live run; dry-run is the default")
+    p.add_argument("--run",type=Path,required=True)
+    p.add_argument("--execute",action="store_true",help="Actually start Claude sessions")
+    p = sub.add_parser("live-observe", help="Observe only registered sessions")
+    p.add_argument("--run",type=Path,required=True)
+    p = sub.add_parser("live-stop", help="Stop only registered sessions; dry-run is the default")
+    p.add_argument("--run",type=Path,required=True)
+    p.add_argument("--execute",action="store_true",help="Actually stop sessions")
     args = parser.parse_args(argv)
     try:
         if args.command in ("prepare", "rehearse"):
@@ -138,7 +147,14 @@ def main(argv=None):
             return 0 if result["status"] == "PASS" else 1
         if args.command == "check":
             return check(args.run,args.case)
-        result = (seed(args.run,args.repository,args.publish) if args.command == "seed" else preflight(args.run))
+        if args.command == "live-launch":
+            result = launch(args.run, dry_run=not args.execute)
+        elif args.command == "live-observe":
+            result = observe(args.run)
+        elif args.command == "live-stop":
+            result = stop(args.run, dry_run=not args.execute)
+        else:
+            result = (seed(args.run,args.repository,args.publish) if args.command == "seed" else preflight(args.run))
         print(json.dumps(result,ensure_ascii=False,indent=2))
         return 2 if result["status"] == "NOT_READY" else 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:

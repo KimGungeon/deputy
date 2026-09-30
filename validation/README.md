@@ -48,3 +48,18 @@ python -m validation.runner preflight --run validation/runs/live-01
 A rehearsal report explicitly separates synthetic results from the live claims
 still unvalidated. Do not call a run an unattended-operation pass based on the
 rehearsal alone.
+
+For a published private validation repository, `live-launch` is still dry-run
+by default. It prints the exact Claude commands and never starts a process:
+
+```text
+python -m validation.runner live-launch --run validation/runs/live-01
+python -m validation.runner live-observe --run validation/runs/live-01
+python -m validation.runner live-stop --run validation/runs/live-01
+```
+
+The execution switch is intentionally explicit and remains blocked until the
+manifest records `mode: live`, all 12 issue IDs, a model, and a verified cost
+meter. Only then would `--execute` start or stop sessions. The adapter resolves
+session IDs from exact cwd/name data and refuses to operate on unregistered or
+foreign sessions.
