@@ -1,7 +1,7 @@
 """next_for_coordinator(cfg, me, full, active, out) 는 deputy next 가 조율자에게
-매 턴 찍어주는 우선순위 안내를 전부 결정한다. full/active 만 받고 내부에서 직접
-gh()/issue() 를 호출하지 않는 순수 함수라 목킹 없이 가짜 이슈 dict 로 바로
-테스트한다. (이슈 #13)
+매 턴 찍어주는 우선순위 안내를 전부 결정한다. full/active 에 가짜 이슈
+dict 를 넣어 테스트한다. 에픽의 자식 조회는 issue()를 모킹해
+외부 요청 없이 검증한다. (이슈 #13)
 
 builder 쪽 분기(cmd_next() 안에 인라인으로 남아 있음)와 '내 분해안 판정'(consensus()
 의존) 은 범위 밖 - 이 이슈가 명시한 4케이스만 다룬다.
@@ -79,6 +79,7 @@ class TestNextForCoordinator(unittest.TestCase):
         self.assertIn("#6", text)
         self.assertIn("lead", text)
         self.assertIn("OBJECT", text)
+        self.assertIn("이 시점에 하면 안 된다", text)
 
     def test_epic_with_all_children_closed_appears_in_rank2(self):
         epic_body = "### 파생 이슈\n- [ ] #2 자식1\n- [ ] #3 자식2\n"
