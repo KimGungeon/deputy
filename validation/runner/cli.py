@@ -102,8 +102,7 @@ def preflight(folder):
     for tool in ("gh", "claude"):
         if not shutil.which(tool):
             blockers.append(f"Missing executable: {tool}")
-    # This release prepares and rehearses; it must not pretend to run live agents.
-    blockers.append("Live launch/observation adapter is not connected; do not use this as an unattended supervisor")
+    blockers.append("Live supervisor requires a verified cost-meter adapter and published run")
     result = {"status":"NOT_READY","blockers":blockers,"live_sessions_started":0}
     write(folder / "reports/preflight.json", result)
     return result
