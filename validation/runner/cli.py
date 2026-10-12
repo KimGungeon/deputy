@@ -73,7 +73,8 @@ def seed(folder, repository=None, publish=False):
     write(folder / "manifest.json", manifest)
     for draft in drafts:
         matches = [i for i in existing if i["title"] == draft["title"]]
-        if len(matches) > 1 or (matches and matches[0]["body"].strip() != draft["body"].strip()):
+        normalize = lambda text: (text or "").replace("\r\n", "\n").strip()
+        if len(matches) > 1 or (matches and normalize(matches[0]["body"]) != normalize(draft["body"])):
             raise ValueError(f"Ambiguous existing issue: {draft['id']}")
         if matches:
             number = matches[0]["number"]
