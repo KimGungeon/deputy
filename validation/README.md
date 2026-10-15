@@ -60,6 +60,20 @@ python -m validation.runner live-observe --run validation/runs/live-01
 python -m validation.runner live-stop --run validation/runs/live-01
 ```
 
+For Claude Code subscription sessions, configure the manifest with
+`budget_mode: subscription_window` and a verified `subscription_limit_policy`,
+then use the bounded supervisor. It treats usage-limited sessions as restart
+candidates and keeps the normal time and restart limits:
+
+```text
+python -m validation.runner live-supervise \
+  --run validation/runs/live-01 --execute --interval 60
+```
+
+Leave out `--execute` to print decisions without stopping or restarting a
+session. The supervisor only restarts sessions whose exact registered project
+path and member name match.
+
 The execution switch is intentionally explicit and remains blocked until the
 manifest records `mode: live`, all 12 issue IDs, a model, and either a verified
 cost meter or a verified subscription-limit policy. Only then would `--execute`
