@@ -8,7 +8,7 @@ import sys
 import json
 
 from .rehearsal import rehearse, load_deputy
-from .live import launch, observe, stop
+from .live import launch, observe, stop, supervise_subscription
 from .workspace import prepare, load_run, read, write, check
 from .control import Limits
 
@@ -143,6 +143,11 @@ def main(argv=None):
     p = sub.add_parser("live-stop", help="Stop only registered sessions; dry-run is the default")
     p.add_argument("--run",type=Path,required=True)
     p.add_argument("--execute",action="store_true",help="Actually stop sessions")
+    p = sub.add_parser("live-supervise", help="Bounded subscription-window supervisor")
+    p.add_argument("--run",type=Path,required=True)
+    p.add_argument("--execute",action="store_true",help="Actually restart and stop Claude sessions")
+    p.add_argument("--max-cycles",type=int)
+    p.add_argument("--interval",type=float)
     args = parser.parse_args(argv)
     try:
         if args.command in ("prepare", "rehearse"):
@@ -163,6 +168,9 @@ def main(argv=None):
             result = observe(args.run)
         elif args.command == "live-stop":
             result = stop(args.run, dry_run=not args.execute)
+        elif args.command == "live-supervise":
+            result = supervise_subscription(args.run, execute=args.execute,
+                                             max_cycles=args.max_cycles, interval=args.interval)
         else:
             result = (seed(args.run,args.repository,args.publish) if args.command == "seed" else preflight(args.run))
         print(json.dumps(result,ensure_ascii=False,indent=2))

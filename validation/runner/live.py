@@ -11,6 +11,8 @@ import subprocess
 from datetime import datetime, timezone
 
 from .workspace import load_run, read, write
+from .control import Controller, Limits
+from .supervisor import Supervisor
 
 
 def claude_executable():
@@ -51,8 +53,8 @@ def _run(folder, args, timeout=45):
                           text=True, encoding="utf-8", timeout=timeout)
 
 
-def observe(folder):
-    """Read only exact-project sessions and return a stable snapshot."""
+def _session_rows(folder):
+    """Return sessions in the registered workspace, without name-only matching."""
     folder, manifest = require_live_manifest(folder)
     exe = claude_executable()
     result = _run(folder, [exe, "agents", "--json", "--cwd", manifest["workspace"]])
@@ -65,6 +67,15 @@ def observe(folder):
             raise ValueError("invalid agents response")
     except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as exc:
         raise RuntimeError("invalid claude agents response") from exc
+    workspace = os.path.normcase(os.path.realpath(manifest["workspace"]))
+    return [row for row in rows
+            if os.path.normcase(os.path.realpath(row.get("cwd") or "")) == workspace]
+
+
+def observe(folder):
+    """Read only exact-project sessions and return a stable snapshot."""
+    folder, manifest = require_live_manifest(folder)
+    rows = _session_rows(folder)
     wanted = set(manifest.get("sessions", {}).values())
     snapshots = []
     for row in rows:
@@ -78,6 +89,81 @@ def observe(folder):
                           "status":row.get("status") or row.get("state"),
                           "startedAt":row.get("startedAt"),"tokens":row.get("tokens")})
     return snapshots
+
+
+def remaining(folder):
+    """Count open issues in the named private validation repository."""
+    folder, manifest = require_live_manifest(folder)
+    gh = shutil.which("gh")
+    if not gh:
+        raise RuntimeError("gh CLI is not on PATH")
+    result = subprocess.run([gh, "issue", "list", "--repo", manifest["repository"],
+                             "--state", "open", "--limit", "1000", "--json", "number"],
+                            cwd=manifest["workspace"], capture_output=True, text=True,
+                            encoding="utf-8", timeout=45)
+    if result.returncode:
+        raise RuntimeError("gh issue list failed: " + result.stderr.strip())
+    try:
+        issues = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("invalid gh issue list response") from exc
+    if not isinstance(issues, list):
+        raise RuntimeError("invalid gh issue list response")
+    return len(issues)
+
+
+def restart_member(folder, member, *, dry_run=True):
+    """Restart one member after a subscription usage-limit observation."""
+    folder, manifest = require_live_manifest(folder)
+    if member not in manifest["members"]:
+        raise ValueError(f"unknown member: {member}")
+    prompt_path = folder / "prompts" / f"{member}.txt"
+    if not prompt_path.is_file():
+        raise RuntimeError(f"missing prompt for {member}")
+    old_id = manifest.get("sessions", {}).get(member)
+    exe = claude_executable()
+    commands = []
+    if old_id:
+        commands.append([exe, "stop", old_id])
+    commands.append([exe, "--bg", "--name", f"deputy-{member}", str(prompt_path)])
+    if dry_run:
+        return {"mode": "dry-run", "member": member, "commands": commands}
+    if old_id:
+        result = _run(folder, commands[0])
+        if result.returncode:
+            raise RuntimeError(f"stop failed for {old_id}: {result.stderr.strip()}")
+    result = subprocess.run(commands[-1], cwd=manifest["workspace"],
+                            env=dict(os.environ, DEPUTY_MEMBER=member), capture_output=True,
+                            text=True, encoding="utf-8", timeout=180)
+    if result.returncode:
+        raise RuntimeError(f"restart failed for {member}: {result.stderr.strip()}")
+    rows = _session_rows(folder)
+    candidates = [row for row in rows if row.get("name") == f"deputy-{member}"]
+    if not candidates:
+        raise RuntimeError(f"restarted {member} but could not verify its session")
+    selected = max(candidates, key=lambda row: row.get("startedAt") or 0)
+    sid = selected.get("sessionId") or selected.get("id")
+    manifest.setdefault("sessions", {})[member] = sid
+    write(folder / "manifest.json", manifest)
+    return {"mode": "live", "member": member, "session": sid}
+
+
+def supervise_subscription(folder, *, execute=False, max_cycles=None, interval=None):
+    """Run the bounded supervisor with subscription-window budget semantics."""
+    folder, manifest = require_live_manifest(folder)
+    if manifest.get("budget_mode", "metered") != "subscription_window":
+        raise RuntimeError("subscription supervisor requires budget_mode=subscription_window")
+    limits = dict(manifest["limits"])
+    limits["cost_usd"] = None
+    controller = Controller(Limits(**limits))
+    supervisor = Supervisor(
+        controller, tuple(manifest["members"]), lambda: observe(folder),
+        lambda: remaining(folder), lambda: None,
+        restart=lambda member: restart_member(folder, member, dry_run=not execute),
+        stop=lambda: stop(folder, dry_run=not execute),
+        interval=interval or 60,
+    )
+    return supervisor.run(max_cycles=max_cycles)
 
 
 def launch(folder, *, dry_run=True):
