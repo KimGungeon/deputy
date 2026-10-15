@@ -62,3 +62,16 @@ class TestSupervisor(unittest.TestCase):
         sup, _ = self.supervisor([[{"name":"deputy-alpha"}]] * 2, [1,1], [2,1])
         result = sup.run(max_cycles=2)
         self.assertEqual(result["terminal"], "observation_failed")
+
+    def test_subscription_window_does_not_require_cost(self):
+        controller = Controller(Limits(seconds=1000, cost_usd=None,
+                                       per_member_restarts=1, total_restarts=1))
+        self.assertEqual(controller.observe(elapsed=1, cost_usd=None, remaining=1), "continue")
+        self.assertEqual(controller.observe(elapsed=2, cost_usd=None, remaining=0), "confirm_completion")
+
+    def test_usage_limited_session_is_restart_candidate(self):
+        sup, _ = self.supervisor([[{"name":"deputy-alpha", "status":"usage_limit"}],
+                                  [{"name":"deputy-alpha", "status":"busy"}]],
+                                 [1,1], [1,2], restart=lambda member: True)
+        result = sup.run(max_cycles=2)
+        self.assertEqual(result["restarts"], {"alpha": 1, "beta": 2})

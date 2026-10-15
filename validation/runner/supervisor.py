@@ -39,7 +39,13 @@ class Supervisor:
             if not isinstance(sessions, list):
                 raise ValueError("session observation must be a list")
             names = {row.get("name") for row in sessions if isinstance(row, dict)}
-            missing = [m for m in self.members if f"deputy-{m}" not in names]
+            unavailable = {"blocked", "rate_limited", "usage_limit", "limit"}
+            unavailable_names = {
+                row.get("name") for row in sessions
+                if isinstance(row, dict) and str(row.get("status", "")).lower() in unavailable
+            }
+            missing = [m for m in self.members
+                       if f"deputy-{m}" not in names or f"deputy-{m}" in unavailable_names]
             decision = self.controller.observe(
                 elapsed=started, cost_usd=cost, remaining=remaining, healthy=True)
         except Exception as exc:

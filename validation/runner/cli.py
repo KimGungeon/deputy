@@ -97,13 +97,23 @@ def preflight(folder):
         blockers.append("Create a fresh run; rehearsal workspaces contain reference answers")
     if not manifest.get("repository") or len(manifest.get("issues", {})) != 12:
         blockers.append("Publish 12 tasks to a dedicated private validation repository")
-    for field in ("model", "cost_meter"):
-        if not manifest.get(field):
-            blockers.append(f"Live run needs a verified {field}")
+    if not manifest.get("model"):
+        blockers.append("Live run needs a verified model")
+    budget_mode = manifest.get("budget_mode", "metered")
+    if budget_mode == "subscription_window":
+        if not manifest.get("subscription_limit_policy"):
+            blockers.append("Live run needs a subscription-limit policy")
+    elif not manifest.get("cost_meter"):
+        blockers.append("Live run needs a verified cost_meter")
+    elif budget_mode != "metered":
+        blockers.append("budget_mode must be metered or subscription_window")
     for tool in ("gh", "claude"):
         if not shutil.which(tool):
             blockers.append(f"Missing executable: {tool}")
-    blockers.append("Live supervisor requires a verified cost-meter adapter and published run")
+    if budget_mode == "subscription_window":
+        blockers.append("Live supervisor requires a verified subscription-limit observer and published run")
+    else:
+        blockers.append("Live supervisor requires a verified cost-meter adapter and published run")
     result = {"status":"NOT_READY","blockers":blockers,"live_sessions_started":0}
     write(folder / "reports/preflight.json", result)
     return result

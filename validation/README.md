@@ -39,7 +39,9 @@ python -m validation.runner seed --run validation/runs/live-01 \
 Publishing is guarded against the real `deputy` repository, an unexpected
 origin, foreign existing issues, and duplicate or changed task bodies. It does
 not start agents. `preflight` deliberately reports `NOT_READY` until a live
-session/observation adapter and verified model/cost meter are supplied:
+session/observation adapter and verified budget policy are supplied. A Claude
+Code subscription run can use `budget_mode: subscription_window` with a
+verified subscription-limit policy instead of a USD cost meter:
 
 ```text
 python -m validation.runner preflight --run validation/runs/live-01
@@ -59,7 +61,8 @@ python -m validation.runner live-stop --run validation/runs/live-01
 ```
 
 The execution switch is intentionally explicit and remains blocked until the
-manifest records `mode: live`, all 12 issue IDs, a model, and a verified cost
-meter. Only then would `--execute` start or stop sessions. The adapter resolves
+manifest records `mode: live`, all 12 issue IDs, a model, and either a verified
+cost meter or a verified subscription-limit policy. Only then would `--execute`
+start or stop sessions. The adapter resolves
 session IDs from exact cwd/name data and refuses to operate on unregistered or
 foreign sessions.

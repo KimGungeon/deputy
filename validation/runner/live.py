@@ -32,8 +32,14 @@ def require_live_manifest(folder):
         blockers.append("12 published validation issues are required")
     if not manifest.get("model"):
         blockers.append("model must be recorded")
-    if not manifest.get("cost_meter"):
+    budget_mode = manifest.get("budget_mode", "metered")
+    if budget_mode == "subscription_window":
+        if not manifest.get("subscription_limit_policy"):
+            blockers.append("subscription_limit_policy must be verified")
+    elif not manifest.get("cost_meter"):
         blockers.append("cost_meter must be verified")
+    elif budget_mode != "metered":
+        blockers.append("budget_mode must be metered or subscription_window")
     if blockers:
         raise RuntimeError("live run blocked: " + "; ".join(blockers))
     return folder, manifest

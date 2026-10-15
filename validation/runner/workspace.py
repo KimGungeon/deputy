@@ -84,6 +84,7 @@ def prepare(run_id, output_root=None):
         "fixture_commit":run(["git","rev-parse","HEAD"], project).stdout.strip(),
         "python":sys.executable,"members":[m["name"] for m in cfg["members"]],
         "repository":None,"sessions":{},"model":None,"cost_meter":None,
+        "budget_mode":"metered","subscription_limit_policy":None,
         "limits":{"seconds":1800,"cost_usd":20,"per_member_restarts":2,"total_restarts":4}}
     write(folder / "manifest.json", manifest)
     return folder

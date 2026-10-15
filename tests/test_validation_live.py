@@ -27,6 +27,18 @@ class TestLiveAdapter(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             live.observe(folder)
 
+    def test_subscription_window_accepts_policy_without_cost_meter(self):
+        folder, manifest = self.make_manifest()
+        manifest["budget_mode"] = "subscription_window"
+        manifest["cost_meter"] = None
+        manifest["subscription_limit_policy"] = "poll-and-restart-after-provider-limit"
+        write(folder / "manifest.json", manifest)
+        rows = []
+        fake = mock.Mock(returncode=0, stdout=json.dumps(rows), stderr="")
+        with mock.patch.object(live, "claude_executable", return_value="claude.cmd"), \
+                mock.patch.object(live.subprocess, "run", return_value=fake):
+            self.assertEqual(live.observe(folder), [])
+
     def test_launch_dry_run_has_no_process_and_uses_pinned_cwd(self):
         folder, manifest = self.make_manifest()
         with mock.patch.object(live, "claude_executable", return_value="claude.cmd"), \
